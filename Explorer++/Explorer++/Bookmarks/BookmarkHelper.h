@@ -40,8 +40,11 @@ void EditBookmarkItem(BookmarkItem *bookmarkItem, BookmarkTree *bookmarkTree, HW
 	PlatformContext *platformContext);
 void RemoveBookmarks(BookmarkTree *bookmarkTree, const RawBookmarkItems &bookmarkItems);
 
+// If a single bookmark is being opened and its location doesn't exist, a message will be shown,
+// giving the user the option of removing the bookmark.
 void OpenBookmarkItemWithDisposition(const BookmarkItem *bookmarkItem,
-	OpenFolderDisposition disposition, BrowserWindow *browser);
+	OpenFolderDisposition disposition, BrowserWindow *browser, BookmarkTree *bookmarkTree,
+	const ResourceLoader *resourceLoader);
 
 bool CopyBookmarkItems(ClipboardStore *clipboardStore, BookmarkTree *bookmarkTree,
 	const RawBookmarkItems &bookmarkItems, ClipboardAction action);

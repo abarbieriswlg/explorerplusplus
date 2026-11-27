@@ -115,7 +115,8 @@ void BookmarkTreePresenter::OnNodeMiddleClicked(TreeViewNode *targetNode, const 
 
 	auto *bookmarkFolder = m_adapter->GetBookmarkForNode(targetNode);
 	BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkFolder,
-		DetermineOpenDisposition(true, event.ctrlKey, event.shiftKey), browser);
+		DetermineOpenDisposition(true, event.ctrlKey, event.shiftKey), browser, m_bookmarkTree,
+		m_resourceLoader);
 }
 
 bool BookmarkTreePresenter::OnNodeRenamed(TreeViewNode *targetNode, const std::wstring &name)

@@ -220,7 +220,8 @@ void BookmarkListPresenter::OnItemsActivated(const std::vector<ListViewItem *> &
 
 		for (BookmarkItem *bookmarkItem : bookmarkItems)
 		{
-			BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkItem, disposition, browser);
+			BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkItem, disposition, browser,
+				m_bookmarkTree, m_resourceLoader);
 
 			disposition = OpenFolderDisposition::BackgroundTab;
 		}

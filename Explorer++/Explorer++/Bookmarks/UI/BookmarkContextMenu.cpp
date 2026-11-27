@@ -181,14 +181,14 @@ void BookmarkContextMenu::OnOpen()
 {
 	DCHECK(m_bookmarkItems.size() == 1 && m_bookmarkItems[0]->IsBookmark());
 	BookmarkHelper::OpenBookmarkItemWithDisposition(m_bookmarkItems[0],
-		OpenFolderDisposition::CurrentTab, m_browser);
+		OpenFolderDisposition::CurrentTab, m_browser, m_bookmarkTree, m_resourceLoader);
 }
 
 void BookmarkContextMenu::OnOpenInNewTab()
 {
 	DCHECK(m_bookmarkItems.size() == 1 && m_bookmarkItems[0]->IsBookmark());
 	BookmarkHelper::OpenBookmarkItemWithDisposition(m_bookmarkItems[0],
-		OpenFolderDisposition::NewTabDefault, m_browser);
+		OpenFolderDisposition::NewTabDefault, m_browser, m_bookmarkTree, m_resourceLoader);
 }
 
 void BookmarkContextMenu::OnOpenAll()
@@ -197,7 +197,8 @@ void BookmarkContextMenu::OnOpenAll()
 
 	for (auto *bookmarkItem : m_bookmarkItems)
 	{
-		BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkItem, disposition, m_browser);
+		BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkItem, disposition, m_browser,
+			m_bookmarkTree, m_resourceLoader);
 
 		disposition = OpenFolderDisposition::BackgroundTab;
 	}
