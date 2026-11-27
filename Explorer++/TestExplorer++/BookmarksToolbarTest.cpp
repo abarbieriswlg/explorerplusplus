@@ -86,6 +86,22 @@ TEST_F(BookmarksToolbarTest, UpdateBookmarks)
 	VerifyToolbarButtons();
 }
 
+TEST_F(BookmarksToolbarTest, UpdateBookmarkLocation)
+{
+	const auto &bookmarks = m_bookmarkTree.GetBookmarksToolbarFolder()->GetChildren();
+	bookmarks[1]->SetLocation(L"c:\\updated\\path");
+
+	VerifyToolbarButtons();
+
+	// Updating the location of a bookmark invalidates the cached icon for the associated button.
+	// Requesting the icon again shouldn't crash (previously, the stop source used when retrieving
+	// the icon was destroyed and not recreated, resulting in a null pointer dereference).
+	auto toolbarItems = m_bookmarksToolbarView.GetItems();
+	ASSERT_EQ(toolbarItems.size(), bookmarks.size());
+	ASSERT_TRUE(toolbarItems[1].IsButton());
+	toolbarItems[1].GetButton()->GetImageIndex();
+}
+
 TEST_F(BookmarksToolbarTest, MoveBookmarks)
 {
 	auto *bookmarksToolbarFolder = m_bookmarkTree.GetBookmarksToolbarFolder();
