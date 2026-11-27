@@ -76,7 +76,11 @@ public:
 
 	void InvalidateCachedIcon()
 	{
-		m_scopedStopSource.reset();
+		// Cancels any in-progress icon retrieval. A new stop source is required here, since
+		// GetImageIndex() will be called again (when the button is updated) and it dereferences
+		// m_scopedStopSource unconditionally. Previously, the pointer was simply reset, which
+		// resulted in a null pointer dereference whenever a bookmark's location was changed.
+		m_scopedStopSource = std::make_unique<ScopedStopSource>();
 		m_iconIndex.reset();
 	}
 
