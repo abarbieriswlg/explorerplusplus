@@ -6,20 +6,29 @@
 
 #include "BaseDialog.h"
 #include "../Helper/DialogSettings.h"
-#include "../Helper/ReferenceCount.h"
+#include "../Helper/Pidl.h"
 #include <boost/circular_buffer.hpp>
 #include <MsXml2.h>
 #include <objbase.h>
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class AcceleratorManager;
 class BrowserList;
+class ClipboardStore;
 class ResourceLoader;
 class SearchDialog;
+class WindowSubclass;
 
 /* Manages settings for the search dialog. */
 class SearchDialogPersistentSettings : public DialogSettings
@@ -32,8 +41,14 @@ private:
 
 	static const TCHAR SETTINGS_KEY[];
 
+	static constexpr int NUM_COLUMNS = 5;
+
 	static const TCHAR SETTING_COLUMN_WIDTH_1[];
 	static const TCHAR SETTING_COLUMN_WIDTH_2[];
+	static const TCHAR SETTING_COLUMN_WIDTH_3[];
+	static const TCHAR SETTING_COLUMN_WIDTH_4[];
+	static const TCHAR SETTING_COLUMN_WIDTH_5[];
+	static const TCHAR SETTING_ITEM_TYPE[];
 	static const TCHAR SETTING_SEARCH_DIRECTORY_TEXT[];
 	static const TCHAR SETTING_SEARCH_SUB_FOLDERS[];
 	static const TCHAR SETTING_USE_REGULAR_EXPRESSIONS[];
@@ -50,7 +65,10 @@ private:
 	enum class SortMode
 	{
 		Name = 1,
-		Path = 2
+		Path = 2,
+		Size = 3,
+		DateModified = 4,
+		Type = 5
 	};
 
 	struct ColumnInfo
@@ -95,41 +113,75 @@ private:
 	SortMode m_SortMode;
 	BOOL m_bSortAscending;
 
-	int m_iColumnWidth1;
-	int m_iColumnWidth2;
+	// Which kinds of items are included in the results (see SearchItemType).
+	int m_itemType;
+
+	// A value of -1 indicates that no width has been saved for the column.
+	std::array<int, NUM_COLUMNS> m_columnWidths;
 };
 
-class Search : public ReferenceCount
+// Which kinds of items should be included in the search results.
+enum class SearchItemType
 {
-public:
-	Search(HWND hDlg, TCHAR *szBaseDirectory, TCHAR *szPattern, DWORD dwAttributes,
-		BOOL bUseRegularExpressions, BOOL bCaseInsensitive, BOOL bSearchSubFolders);
-	~Search();
+	FilesAndFolders = 0,
+	FilesOnly = 1,
+	FoldersOnly = 2
+};
 
-	void StartSearching();
-	void StopSearching();
+struct SearchParameters
+{
+	std::wstring baseDirectory;
+	std::wstring pattern;
+	DWORD attributes = 0;
+	bool useRegularExpressions = false;
+	bool caseInsensitive = false;
+	bool searchSubFolders = true;
+	SearchItemType itemType = SearchItemType::FilesAndFolders;
+	std::optional<uint64_t> minSize;
+	std::optional<uint64_t> maxSize;
 
-private:
-	void SearchDirectory(const TCHAR *szDirectory);
-	void SearchDirectoryInternal(const TCHAR *szSearchDirectory,
-		std::list<std::wstring> *pSubFolderList);
+	// UTC times. Items are matched if their last modified time is within [modifiedAfter,
+	// modifiedBefore).
+	std::optional<FILETIME> modifiedAfter;
+	std::optional<FILETIME> modifiedBefore;
+};
 
-	HWND m_hDlg;
+// A single item found during a search. The directory is stored separately (and shared between all
+// the items in that directory), to reduce memory usage when there are a large number of results.
+struct SearchResult
+{
+	std::wstring name;
+	uint32_t directoryIndex;
+	DWORD attributes;
+	uint64_t size;
+	FILETIME lastModified;
 
-	TCHAR m_szBaseDirectory[MAX_PATH];
-	TCHAR m_szSearchPattern[MAX_PATH + 2];
-	DWORD m_dwAttributes;
-	BOOL m_bUseRegularExpressions;
-	BOOL m_bCaseInsensitive;
-	BOOL m_bSearchSubFolders;
+	// Lazily retrieved, the first time the item is shown.
+	int iconIndex = -1;
+};
 
-	std::wregex m_rxPattern;
+// State shared between the dialog and the background search thread. The thread holds a reference
+// to this object, so that it remains valid even if the dialog is closed while a search is in
+// progress.
+struct SearchSharedState
+{
+	std::mutex mutex;
 
-	CRITICAL_SECTION m_csStop;
-	BOOL m_bStopSearching;
+	// The window that's notified when results are available or when the search finishes. Set to
+	// nullptr when the dialog is destroyed.
+	HWND notifyWindow = nullptr;
 
-	int m_iFoldersFound;
-	int m_iFilesFound;
+	std::atomic<bool> stopRequested = false;
+
+	// Results that have been found, but not yet picked up by the dialog.
+	std::vector<SearchResult> pendingResults;
+	std::vector<std::wstring> pendingDirectories;
+	bool resultsNotificationPending = false;
+
+	std::wstring currentDirectory;
+	int foldersFound = 0;
+	int filesFound = 0;
+	bool regularExpressionInvalid = false;
 };
 
 class SearchDialog : public BaseDialog
@@ -137,12 +189,7 @@ class SearchDialog : public BaseDialog
 public:
 	static SearchDialog *Create(const ResourceLoader *resourceLoader, HWND hParent,
 		std::wstring_view searchDirectory, BrowserList *browserList,
-		const AcceleratorManager *acceleratorManager);
-
-	/* Sorting methods. */
-	int CALLBACK SortResults(LPARAM lParam1, LPARAM lParam2);
-	int CALLBACK SortResultsByName(LPARAM lParam1, LPARAM lParam2);
-	int CALLBACK SortResultsByPath(LPARAM lParam1, LPARAM lParam2);
+		const AcceleratorManager *acceleratorManager, ClipboardStore *clipboardStore);
 
 protected:
 	INT_PTR OnInitDialog() override;
@@ -150,46 +197,97 @@ protected:
 	INT_PTR OnCommand(WPARAM wParam, LPARAM lParam) override;
 	INT_PTR OnNotify(NMHDR *pnmhdr) override;
 	INT_PTR OnClose() override;
+	INT_PTR OnDestroy() override;
 
 	INT_PTR OnPrivateMessage(UINT uMsg, WPARAM wParam, LPARAM lParam) override;
 
 private:
-	static const int SEARCH_PROCESSITEMS_TIMER_ID = 0;
-	static const int SEARCH_PROCESSITEMS_TIMER_ELAPSED = 50;
-	static const int SEARCH_MAX_ITEMS_BATCH_PROCESS = 100;
+	static const int STATUS_UPDATE_TIMER_ID = 1;
+	static const int STATUS_UPDATE_TIMER_ELAPSED = 200;
+
+	struct TypeInfo
+	{
+		std::wstring typeName;
+		int iconIndex;
+	};
 
 	SearchDialog(const ResourceLoader *resourceLoader, HWND hParent,
 		std::wstring_view searchDirectory, BrowserList *browserList,
-		const AcceleratorManager *acceleratorManager);
+		const AcceleratorManager *acceleratorManager, ClipboardStore *clipboardStore);
 	~SearchDialog();
 
+	void AddDynamicControls() override;
 	std::vector<ResizableDialogControl> GetResizableControls() override;
 	void SaveState() override;
+
+	void SetUpFilterControls();
+	std::optional<SearchParameters> BuildSearchParameters();
+	std::optional<uint64_t> GetSizeFilterValue(int editId, int unitId);
+	std::optional<FILETIME> GetDateFilterValue(int dateTimePickerId, bool endOfDay);
 
 	void OnBrowserForFolder();
 	void OnSearch();
 	void StartSearching();
 	void StopSearching();
+	void OnResultsAvailable();
+	void OnSearchFinished();
+	void UpdateSearchingStatus();
 	void SaveEntry(int comboBoxId, boost::circular_buffer<std::wstring> &buffer);
+
+	// Results listview.
+	HWND GetResultsListView() const;
+	LRESULT ResultsListViewSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+	void OnGetDisplayInfo(NMLVDISPINFO *dispInfo);
+	int OnFindItem(const NMLVFINDITEM *findItem);
+	void OnColumnClicked(int column);
+	void SortResults();
+	int CompareResults(const SearchResult &result1, const SearchResult &result2) const;
 	void UpdateListViewHeader();
+	void ShowContextMenu(const POINT &ptScreen);
+	void ShowMixedLocationsContextMenu(const POINT &ptScreen, const std::vector<size_t> &items);
+
+	// Actions on the results.
+	std::vector<size_t> GetSelectedResults() const;
+	std::optional<size_t> GetResultAtListIndex(int index) const;
+	std::wstring GetResultPath(size_t resultIndex) const;
+	std::vector<PidlAbsolute> GetPidlsForResults(const std::vector<size_t> &items) const;
+	void OpenResults(const std::vector<size_t> &items);
+	void OpenResultLocation(size_t resultIndex);
+	void CopyResultsToClipboard(const std::vector<size_t> &items, bool cut);
+	void CopyResultPathsToClipboard(const std::vector<size_t> &items);
+	void DeleteResults(const std::vector<size_t> &items, bool permanent);
+	void StartDraggingResults(const std::vector<size_t> &items);
+	void RemoveResultsThatNoLongerExist(const std::vector<size_t> &items);
+	void SelectAllResults();
+
+	const TypeInfo &GetTypeInfo(const SearchResult &result) const;
+	int GetIconIndex(SearchResult &result);
+	std::wstring GetColumnText(const SearchResult &result, int column) const;
 
 	std::wstring m_searchDirectory;
 	BrowserList *const m_browserList;
 	const AcceleratorManager *const m_acceleratorManager;
+	ClipboardStore *const m_clipboardStore;
 	wil::unique_hicon m_directoryIcon;
-	BOOL m_bSearching;
-	BOOL m_bStopSearching;
+	bool m_searching = false;
 	TCHAR m_szSearchButton[32];
 
-	Search *m_pSearch = nullptr;
+	std::shared_ptr<SearchSharedState> m_searchState;
 
-	/* Listview item information. */
-	std::list<PIDLIST_ABSOLUTE> m_AwaitingSearchItems;
-	std::unordered_map<int, std::wstring> m_SearchItemsMapInternal;
-	int m_iInternalIndex;
-	int m_iPreviousSelectedColumn;
+	// All results found so far. Results are only ever appended to this vector (or removed, if the
+	// underlying item is deleted). The display order is determined by m_displayOrder, which
+	// contains indexes into m_results.
+	std::vector<SearchResult> m_results;
+	std::vector<std::wstring> m_directories;
+	std::vector<size_t> m_displayOrder;
 
-	BOOL m_bSetSearchTimer;
+	// True if results have been appended (in an unsorted order) since the last sort.
+	bool m_sortPending = false;
+
+	mutable std::unordered_map<std::wstring, TypeInfo> m_typeInfoCache;
+
+	std::unique_ptr<WindowSubclass> m_listViewSubclass;
+	int m_iPreviousSelectedColumn = -1;
 
 	SearchDialogPersistentSettings *m_persistentSettings = nullptr;
 };

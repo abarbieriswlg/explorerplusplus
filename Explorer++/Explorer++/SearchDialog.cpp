@@ -5,6 +5,7 @@
 #include "stdafx.h"
 #include "SearchDialog.h"
 #include "BrowserList.h"
+#include "BrowserView.h"
 #include "BrowserWindow.h"
 #include "DialogConstants.h"
 #include "MainResource.h"
@@ -13,87 +14,471 @@
 #include "ResourceLoader.h"
 #include "SearchResultsItemContextMenu.h"
 #include "ShellBrowser/NavigateParams.h"
-#include "ShellBrowser/ShellBrowserImpl.h"
+#include "ShellBrowser/ShellBrowser.h"
+#include "ShellBrowser/ShellNavigationController.h"
+#include "../Helper/BulkClipboardWriter.h"
 #include "../Helper/ComboBox.h"
 #include "../Helper/Controls.h"
 #include "../Helper/DpiCompatibility.h"
+#include "../Helper/DragDropHelper.h"
 #include "../Helper/FileDialogs.h"
+#include "../Helper/FileOperations.h"
 #include "../Helper/Helper.h"
 #include "../Helper/ImageInterop.h"
 #include "../Helper/RegistrySettings.h"
 #include "../Helper/ShellHelper.h"
+#include "../Helper/StringHelper.h"
 #include "../Helper/WindowHelper.h"
+#include "../Helper/WindowSubclass.h"
 #include "../Helper/XMLSettings.h"
+#include <wil/common.h>
 #include <Shlwapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <chrono>
+#include <format>
 #include <regex>
+#include <thread>
 
-namespace NSearchDialog
+namespace
 {
 
-const int WM_APP_SEARCHITEMFOUND = WM_APP + 1;
-const int WM_APP_SEARCHFINISHED = WM_APP + 2;
-const int WM_APP_SEARCHCHANGEDDIRECTORY = WM_APP + 3;
-const int WM_APP_REGULAREXPRESSIONINVALID = WM_APP + 4;
+const UINT WM_APP_SEARCH_RESULTS_AVAILABLE = WM_APP + 1;
+const UINT WM_APP_SEARCH_FINISHED = WM_APP + 2;
 
-int CALLBACK SortResultsStub(LPARAM lParam1, LPARAM lParam2, LPARAM lParamSort);
+// The number of results the search thread accumulates before handing them over to the dialog.
+// Results are also handed over after a short period of time, so that they appear promptly even
+// when matches are infrequent.
+constexpr size_t RESULTS_BATCH_SIZE = 512;
+constexpr auto RESULTS_BATCH_INTERVAL = std::chrono::milliseconds(100);
 
-DWORD WINAPI SearchThread(LPVOID pParam);
+// The maximum number of items that will be opened at once when activating a multi-item selection.
+constexpr size_t MAX_ITEMS_TO_OPEN = 20;
+
+enum class ResultsColumn
+{
+	Name = 0,
+	Path = 1,
+	Size = 2,
+	DateModified = 3,
+	Type = 4
+};
+
+class SearchWorker
+{
+public:
+	SearchWorker(SearchParameters parameters, std::shared_ptr<SearchSharedState> state) :
+		m_parameters(std::move(parameters)),
+		m_state(std::move(state))
+	{
+	}
+
+	void Run()
+	{
+		if (!InitializePattern())
+		{
+			std::scoped_lock lock(m_state->mutex);
+			m_state->regularExpressionInvalid = true;
+			NotifyFinishedLocked();
+			return;
+		}
+
+		m_lastFlush = std::chrono::steady_clock::now();
+
+		std::vector<std::wstring> directoriesToSearch;
+		directoriesToSearch.push_back(m_parameters.baseDirectory);
+
+		while (!directoriesToSearch.empty() && !m_state->stopRequested)
+		{
+			std::wstring directory = std::move(directoriesToSearch.back());
+			directoriesToSearch.pop_back();
+
+			{
+				std::scoped_lock lock(m_state->mutex);
+				m_state->currentDirectory = directory;
+			}
+
+			std::vector<std::wstring> subfolders;
+			SearchDirectory(directory, subfolders);
+
+			// The subfolders are added in reverse order, so that they're searched in the order
+			// in which they were enumerated.
+			directoriesToSearch.insert(directoriesToSearch.end(),
+				std::make_move_iterator(subfolders.rbegin()),
+				std::make_move_iterator(subfolders.rend()));
+
+			if (m_batch.size() >= RESULTS_BATCH_SIZE
+				|| (std::chrono::steady_clock::now() - m_lastFlush) >= RESULTS_BATCH_INTERVAL)
+			{
+				FlushResults();
+			}
+		}
+
+		FlushResults();
+
+		std::scoped_lock lock(m_state->mutex);
+		m_state->foldersFound = m_foldersFound;
+		m_state->filesFound = m_filesFound;
+		NotifyFinishedLocked();
+	}
+
+private:
+	bool InitializePattern()
+	{
+		if (m_parameters.pattern.empty())
+		{
+			return true;
+		}
+
+		if (m_parameters.useRegularExpressions)
+		{
+			try
+			{
+				auto flags = std::regex_constants::ECMAScript;
+
+				if (m_parameters.caseInsensitive)
+				{
+					flags |= std::regex_constants::icase;
+				}
+
+				m_regex.assign(m_parameters.pattern, flags);
+			}
+			catch (const std::regex_error &)
+			{
+				return false;
+			}
+
+			return true;
+		}
+
+		// Patterns of the form "abc" are turned into "*abc*", so that they match any name that
+		// contains the text.
+		const auto &pattern = m_parameters.pattern;
+
+		if (pattern.front() != '*' && pattern.back() != '*')
+		{
+			m_wildcardPattern = L"*" + pattern + L"*";
+		}
+		else
+		{
+			m_wildcardPattern = pattern;
+		}
+
+		return true;
+	}
+
+	static std::wstring CombinePath(const std::wstring &directory, const wchar_t *name)
+	{
+		std::wstring path = directory;
+
+		if (!path.empty() && path.back() != '\\')
+		{
+			path += '\\';
+		}
+
+		path += name;
+		return path;
+	}
+
+	// Paths longer than MAX_PATH need to be prefixed, so that the Unicode versions of the file
+	// APIs will accept them.
+	static std::wstring GetEnumerationPattern(const std::wstring &directory)
+	{
+		std::wstring pattern = CombinePath(directory, L"*");
+
+		if (pattern.size() >= MAX_PATH && pattern.compare(0, 4, L"\\\\?\\") != 0)
+		{
+			if (pattern.compare(0, 2, L"\\\\") == 0)
+			{
+				pattern = L"\\\\?\\UNC\\" + pattern.substr(2);
+			}
+			else
+			{
+				pattern = L"\\\\?\\" + pattern;
+			}
+		}
+
+		return pattern;
+	}
+
+	// Junctions and symbolic links to directories aren't followed, since they can create cycles
+	// (and often point to locations that are searched anyway). Other reparse points (e.g. the
+	// placeholders used by OneDrive and other cloud storage providers) are treated as normal
+	// directories.
+	static bool IsDirectoryLink(const WIN32_FIND_DATA &findData)
+	{
+		if (WI_IsFlagClear(findData.dwFileAttributes, FILE_ATTRIBUTE_REPARSE_POINT))
+		{
+			return false;
+		}
+
+		return findData.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT
+			|| findData.dwReserved0 == IO_REPARSE_TAG_SYMLINK;
+	}
+
+	void SearchDirectory(const std::wstring &directory, std::vector<std::wstring> &subfolders)
+	{
+		WIN32_FIND_DATA findData;
+		HANDLE findHandle = FindFirstFileEx(GetEnumerationPattern(directory).c_str(),
+			FindExInfoBasic, &findData, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+
+		if (findHandle == INVALID_HANDLE_VALUE)
+		{
+			return;
+		}
+
+		std::optional<uint32_t> directoryIndex;
+
+		// Note that the first item returned by FindFirstFileEx() is processed here as well.
+		// Previously, the first item was skipped (on the assumption that it was "."), which meant
+		// that one item was missed when searching from the root of a drive.
+		do
+		{
+			if (lstrcmp(findData.cFileName, L".") == 0 || lstrcmp(findData.cFileName, L"..") == 0)
+			{
+				continue;
+			}
+
+			bool isFolder = WI_IsFlagSet(findData.dwFileAttributes, FILE_ATTRIBUTE_DIRECTORY);
+
+			if (Matches(findData, isFolder))
+			{
+				if (!directoryIndex)
+				{
+					directoryIndex = m_nextDirectoryIndex++;
+					m_batchDirectories.push_back(directory);
+				}
+
+				ULARGE_INTEGER size = { { findData.nFileSizeLow, findData.nFileSizeHigh } };
+
+				SearchResult result;
+				result.name = findData.cFileName;
+				result.directoryIndex = *directoryIndex;
+				result.attributes = findData.dwFileAttributes;
+				result.size = isFolder ? 0 : size.QuadPart;
+				result.lastModified = findData.ftLastWriteTime;
+				m_batch.push_back(std::move(result));
+
+				if (isFolder)
+				{
+					m_foldersFound++;
+				}
+				else
+				{
+					m_filesFound++;
+				}
+			}
+
+			if (isFolder && m_parameters.searchSubFolders && !IsDirectoryLink(findData))
+			{
+				subfolders.push_back(CombinePath(directory, findData.cFileName));
+			}
+		} while (!m_state->stopRequested && FindNextFile(findHandle, &findData));
+
+		FindClose(findHandle);
+	}
+
+	bool Matches(const WIN32_FIND_DATA &findData, bool isFolder) const
+	{
+		if (m_parameters.itemType == SearchItemType::FilesOnly && isFolder)
+		{
+			return false;
+		}
+
+		if (m_parameters.itemType == SearchItemType::FoldersOnly && !isFolder)
+		{
+			return false;
+		}
+
+		if (m_parameters.attributes != 0
+			&& (findData.dwFileAttributes & m_parameters.attributes) != m_parameters.attributes)
+		{
+			return false;
+		}
+
+		if (m_parameters.minSize || m_parameters.maxSize)
+		{
+			// Folders don't have a size, so they never match a size filter.
+			if (isFolder)
+			{
+				return false;
+			}
+
+			ULARGE_INTEGER size = { { findData.nFileSizeLow, findData.nFileSizeHigh } };
+
+			if (m_parameters.minSize && size.QuadPart < *m_parameters.minSize)
+			{
+				return false;
+			}
+
+			if (m_parameters.maxSize && size.QuadPart > *m_parameters.maxSize)
+			{
+				return false;
+			}
+		}
+
+		if (m_parameters.modifiedAfter
+			&& CompareFileTime(&findData.ftLastWriteTime, &*m_parameters.modifiedAfter) < 0)
+		{
+			return false;
+		}
+
+		if (m_parameters.modifiedBefore
+			&& CompareFileTime(&findData.ftLastWriteTime, &*m_parameters.modifiedBefore) >= 0)
+		{
+			return false;
+		}
+
+		if (m_parameters.pattern.empty())
+		{
+			return true;
+		}
+
+		if (m_parameters.useRegularExpressions)
+		{
+			return std::regex_match(findData.cFileName, m_regex);
+		}
+
+		return CheckWildcardMatch(m_wildcardPattern.c_str(), findData.cFileName,
+			!m_parameters.caseInsensitive);
+	}
+
+	void FlushResults()
+	{
+		m_lastFlush = std::chrono::steady_clock::now();
+
+		if (m_batch.empty())
+		{
+			return;
+		}
+
+		std::scoped_lock lock(m_state->mutex);
+
+		m_state->pendingDirectories.insert(m_state->pendingDirectories.end(),
+			std::make_move_iterator(m_batchDirectories.begin()),
+			std::make_move_iterator(m_batchDirectories.end()));
+		m_state->pendingResults.insert(m_state->pendingResults.end(),
+			std::make_move_iterator(m_batch.begin()), std::make_move_iterator(m_batch.end()));
+		m_state->foldersFound = m_foldersFound;
+		m_state->filesFound = m_filesFound;
+
+		m_batch.clear();
+		m_batchDirectories.clear();
+
+		// Only a single notification is posted until the dialog picks up the results. That
+		// avoids flooding the dialog's message queue.
+		if (!m_state->resultsNotificationPending && m_state->notifyWindow)
+		{
+			m_state->resultsNotificationPending = true;
+			PostMessage(m_state->notifyWindow, WM_APP_SEARCH_RESULTS_AVAILABLE, 0, 0);
+		}
+	}
+
+	void NotifyFinishedLocked()
+	{
+		if (m_state->notifyWindow)
+		{
+			PostMessage(m_state->notifyWindow, WM_APP_SEARCH_FINISHED, 0, 0);
+		}
+	}
+
+	const SearchParameters m_parameters;
+	const std::shared_ptr<SearchSharedState> m_state;
+
+	std::wregex m_regex;
+	std::wstring m_wildcardPattern;
+
+	std::vector<SearchResult> m_batch;
+	std::vector<std::wstring> m_batchDirectories;
+	uint32_t m_nextDirectoryIndex = 0;
+	std::chrono::steady_clock::time_point m_lastFlush;
+
+	int m_foldersFound = 0;
+	int m_filesFound = 0;
+};
+
+bool ResultHasPerFileIcon(const std::wstring &name)
+{
+	const wchar_t *extension = PathFindExtension(name.c_str());
+
+	// These file types typically have icons that are specific to each file.
+	static const wchar_t *const perFileIconExtensions[] = { L".exe", L".lnk", L".ico", L".url",
+		L".cpl", L".msc", L".scr", L".appref-ms" };
+
+	for (const auto *perFileIconExtension : perFileIconExtensions)
+	{
+		if (lstrcmpi(extension, perFileIconExtension) == 0)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
 
 }
 
-const TCHAR SearchDialogPersistentSettings::SETTINGS_KEY[] = _T("Search");
-
-const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_1[] = _T("ColumnWidth1");
-const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_2[] = _T("ColumnWidth2");
-const TCHAR SearchDialogPersistentSettings::SETTING_SEARCH_DIRECTORY_TEXT[] =
-	_T("SearchDirectoryText");
-const TCHAR SearchDialogPersistentSettings::SETTING_SEARCH_SUB_FOLDERS[] = _T("SearchSubFolders");
-const TCHAR SearchDialogPersistentSettings::SETTING_USE_REGULAR_EXPRESSIONS[] =
-	_T("UseRegularExpressions");
-const TCHAR SearchDialogPersistentSettings::SETTING_CASE_INSENSITIVE[] = _T("CaseInsensitive");
-const TCHAR SearchDialogPersistentSettings::SETTING_ARCHIVE[] = _T("Archive");
-const TCHAR SearchDialogPersistentSettings::SETTING_HIDDEN[] = _T("Hidden");
-const TCHAR SearchDialogPersistentSettings::SETTING_READ_ONLY[] = _T("ReadOnly");
-const TCHAR SearchDialogPersistentSettings::SETTING_SYSTEM[] = _T("System");
-const TCHAR SearchDialogPersistentSettings::SETTING_SORT_MODE[] = _T("SortMode");
-const TCHAR SearchDialogPersistentSettings::SETTING_SORT_ASCENDING[] = _T("SortAscending");
-const TCHAR SearchDialogPersistentSettings::SETTING_DIRECTORY_LIST[] = _T("Directory");
-const TCHAR SearchDialogPersistentSettings::SETTING_PATTERN_LIST[] = _T("Pattern");
-
 SearchDialog *SearchDialog::Create(const ResourceLoader *resourceLoader, HWND hParent,
 	std::wstring_view searchDirectory, BrowserList *browserList,
-	const AcceleratorManager *acceleratorManager)
+	const AcceleratorManager *acceleratorManager, ClipboardStore *clipboardStore)
 {
 	return new SearchDialog(resourceLoader, hParent, searchDirectory, browserList,
-		acceleratorManager);
+		acceleratorManager, clipboardStore);
 }
 
 SearchDialog::SearchDialog(const ResourceLoader *resourceLoader, HWND hParent,
 	std::wstring_view searchDirectory, BrowserList *browserList,
-	const AcceleratorManager *acceleratorManager) :
+	const AcceleratorManager *acceleratorManager, ClipboardStore *clipboardStore) :
 	BaseDialog(resourceLoader, IDD_SEARCH, hParent, DialogSizingType::Both, Icon::Search),
 	m_searchDirectory(searchDirectory),
 	m_browserList(browserList),
 	m_acceleratorManager(acceleratorManager),
-	m_bSearching(FALSE),
-	m_bStopSearching(FALSE),
-	m_pSearch(nullptr),
-	m_iInternalIndex(0),
-	m_iPreviousSelectedColumn(-1),
-	m_bSetSearchTimer(TRUE)
+	m_clipboardStore(clipboardStore)
 {
 	m_persistentSettings = &SearchDialogPersistentSettings::GetInstance();
 }
 
 SearchDialog::~SearchDialog()
 {
-	if (m_pSearch != nullptr)
-	{
-		m_pSearch->StopSearching();
-		m_pSearch->Release();
-	}
+	StopSearching();
+}
+
+void SearchDialog::AddDynamicControls()
+{
+	// The results listview is replaced with a virtual listview. With a large number of results,
+	// that's significantly faster than inserting each result individually. Replacing the control
+	// here (rather than changing the dialog template) means that this also works when the dialog
+	// is loaded from a translation DLL.
+	HWND originalListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
+	CHECK(originalListView);
+
+	RECT rect;
+	GetWindowRect(originalListView, &rect);
+	MapWindowPoints(nullptr, m_hDlg, reinterpret_cast<POINT *>(&rect), 2);
+
+	DWORD style = static_cast<DWORD>(GetWindowLongPtr(originalListView, GWL_STYLE));
+	DWORD exStyle = static_cast<DWORD>(GetWindowLongPtr(originalListView, GWL_EXSTYLE));
+	HWND previousControl = GetWindow(originalListView, GW_HWNDPREV);
+
+	DestroyWindow(originalListView);
+
+	WI_SetFlag(style, LVS_OWNERDATA);
+	WI_ClearFlag(style, LVS_SINGLESEL);
+
+	HWND listView = CreateWindowEx(exStyle, WC_LISTVIEW, L"", style, rect.left, rect.top,
+		GetRectWidth(&rect), GetRectHeight(&rect), m_hDlg,
+		reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LISTVIEW_SEARCHRESULTS)),
+		GetModuleHandle(nullptr), nullptr);
+	CHECK(listView);
+
+	// Keep the tab order the same as it was for the original control.
+	SetWindowPos(listView, previousControl ? previousControl : HWND_TOP, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+	SendMessage(listView, WM_SETFONT, SendMessage(m_hDlg, WM_GETFONT, 0, 0), false);
+
+	m_listViewSubclass = std::make_unique<WindowSubclass>(listView,
+		std::bind_front(&SearchDialog::ResultsListViewSubclass, this));
 }
 
 INT_PTR SearchDialog::OnInitDialog()
@@ -105,10 +490,15 @@ INT_PTR SearchDialog::OnInitDialog()
 	SendMessage(GetDlgItem(m_hDlg, IDC_BUTTON_DIRECTORY), BM_SETIMAGE, IMAGE_ICON,
 		reinterpret_cast<LPARAM>(m_directoryIcon.get()));
 
-	HWND hListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
+	HWND hListView = GetResultsListView();
 
-	ListView_SetExtendedListViewStyleEx(hListView, LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER,
-		LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+	ListView_SetExtendedListViewStyleEx(hListView,
+		LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP,
+		LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP);
+	SetWindowTheme(hListView, L"Explorer", nullptr);
+
+	// Hidden items are shown ghosted. The cut state is provided via LVN_GETDISPINFO.
+	ListView_SetCallbackMask(hListView, LVIS_CUT);
 
 	HIMAGELIST himlSmall;
 	Shell_GetImageLists(nullptr, &himlSmall);
@@ -121,7 +511,10 @@ INT_PTR SearchDialog::OnInitDialog()
 		auto columnName = m_resourceLoader->LoadString(ci.uStringID);
 
 		LVCOLUMN lvColumn;
-		lvColumn.mask = LVCF_TEXT;
+		lvColumn.mask = LVCF_TEXT | LVCF_FMT;
+		lvColumn.fmt = (ci.sortMode == SearchDialogPersistentSettings::SortMode::Size)
+			? LVCFMT_RIGHT
+			: LVCFMT_LEFT;
 		lvColumn.pszText = columnName.data();
 		ListView_InsertColumn(hListView, i, &lvColumn);
 
@@ -130,9 +523,30 @@ INT_PTR SearchDialog::OnInitDialog()
 
 	RECT rc;
 	GetClientRect(hListView, &rc);
+	int width = GetRectWidth(&rc);
 
-	ListView_SetColumnWidth(hListView, 0, (1.0 / 3.0) * GetRectWidth(&rc));
-	ListView_SetColumnWidth(hListView, 1, (1.80 / 3.0) * GetRectWidth(&rc));
+	const double defaultColumnWidths[] = { 0.30, 0.38, 0.10, 0.14, 0.08 };
+	static_assert(std::size(defaultColumnWidths) == SearchDialogPersistentSettings::NUM_COLUMNS);
+
+	for (int column = 0; column < SearchDialogPersistentSettings::NUM_COLUMNS; column++)
+	{
+		int columnWidth = static_cast<int>(defaultColumnWidths[column] * width);
+
+		if (m_persistentSettings->m_bStateSaved && m_persistentSettings->m_columnWidths[column] > 0)
+		{
+			columnWidth = m_persistentSettings->m_columnWidths[column];
+		}
+
+		ListView_SetColumnWidth(hListView, column, columnWidth);
+	}
+
+	auto sortMode = m_persistentSettings->m_SortMode;
+
+	if (std::none_of(m_persistentSettings->m_Columns.begin(), m_persistentSettings->m_Columns.end(),
+			[sortMode](const auto &column) { return column.sortMode == sortMode; }))
+	{
+		m_persistentSettings->m_SortMode = SearchDialogPersistentSettings::SortMode::Name;
+	}
 
 	UpdateListViewHeader();
 
@@ -163,23 +577,63 @@ INT_PTR SearchDialog::OnInitDialog()
 	ComboBox::CreateNew(GetDlgItem(m_hDlg, IDC_COMBO_NAME));
 	ComboBox::CreateNew(GetDlgItem(m_hDlg, IDC_COMBO_DIRECTORY));
 
-	if (m_persistentSettings->m_bStateSaved)
-	{
-		/* These dummy values will be in use if these values
-		have not previously been saved. */
-		if (m_persistentSettings->m_iColumnWidth1 != -1
-			&& m_persistentSettings->m_iColumnWidth2 != -1)
-		{
-			ListView_SetColumnWidth(hListView, 0, m_persistentSettings->m_iColumnWidth1);
-			ListView_SetColumnWidth(hListView, 1, m_persistentSettings->m_iColumnWidth2);
-		}
-	}
+	SetUpFilterControls();
 
 	SetFocus(GetDlgItem(m_hDlg, IDC_COMBO_NAME));
 
 	m_persistentSettings->RestoreDialogPosition(m_hDlg, true);
 
 	return FALSE;
+}
+
+void SearchDialog::SetUpFilterControls()
+{
+	// The filter controls may not be present (e.g. if the dialog was loaded from a translation DLL
+	// that hasn't been updated yet). In that case, the filters simply aren't available.
+	if (HWND itemTypeCombo = GetDlgItem(m_hDlg, IDC_SEARCH_ITEM_TYPE))
+	{
+		ComboBox_AddString(itemTypeCombo,
+			m_resourceLoader->LoadString(IDS_SEARCH_ITEM_TYPE_FILES_AND_FOLDERS).c_str());
+		ComboBox_AddString(itemTypeCombo,
+			m_resourceLoader->LoadString(IDS_SEARCH_ITEM_TYPE_FILES_ONLY).c_str());
+		ComboBox_AddString(itemTypeCombo,
+			m_resourceLoader->LoadString(IDS_SEARCH_ITEM_TYPE_FOLDERS_ONLY).c_str());
+
+		int itemType = std::clamp(m_persistentSettings->m_itemType, 0, 2);
+		ComboBox_SetCurSel(itemTypeCombo, itemType);
+	}
+
+	for (int unitId : { IDC_SEARCH_MIN_SIZE_UNIT, IDC_SEARCH_MAX_SIZE_UNIT })
+	{
+		HWND unitCombo = GetDlgItem(m_hDlg, unitId);
+
+		if (!unitCombo)
+		{
+			continue;
+		}
+
+		for (const auto *unit : { L"KB", L"MB", L"GB" })
+		{
+			ComboBox_AddString(unitCombo, unit);
+		}
+
+		// Default to MB, which is likely to be the most commonly used unit.
+		ComboBox_SetCurSel(unitCombo, 1);
+	}
+
+	for (int dateTimePickerId : { IDC_SEARCH_MODIFIED_AFTER, IDC_SEARCH_MODIFIED_BEFORE })
+	{
+		HWND dateTimePicker = GetDlgItem(m_hDlg, dateTimePickerId);
+
+		if (!dateTimePicker)
+		{
+			continue;
+		}
+
+		// The date filters are disabled by default (the checkbox within the control is
+		// unchecked).
+		DateTime_SetSystemtime(dateTimePicker, GDT_NONE, nullptr);
+	}
 }
 
 std::vector<ResizableDialogControl> SearchDialog::GetResizableControls()
@@ -203,6 +657,12 @@ std::vector<ResizableDialogControl> SearchDialog::GetResizableControls()
 		SizingType::Horizontal);
 	controls.emplace_back(GetDlgItem(m_hDlg, IDSEARCH), MovingType::Both, SizingType::None);
 	controls.emplace_back(GetDlgItem(m_hDlg, IDEXIT), MovingType::Both, SizingType::None);
+
+	if (HWND filtersGroup = GetDlgItem(m_hDlg, IDC_GROUP_SEARCH_FILTERS))
+	{
+		controls.emplace_back(filtersGroup, MovingType::None, SizingType::Horizontal);
+	}
+
 	return controls;
 }
 
@@ -250,7 +710,7 @@ void SearchDialog::OnBrowserForFolder()
 
 void SearchDialog::OnSearch()
 {
-	if (!m_bSearching)
+	if (!m_searching)
 	{
 		StartSearching();
 	}
@@ -260,97 +720,195 @@ void SearchDialog::OnSearch()
 	}
 }
 
-void SearchDialog::StartSearching()
+std::optional<uint64_t> SearchDialog::GetSizeFilterValue(int editId, int unitId)
 {
-	ShowWindow(GetDlgItem(m_hDlg, IDC_LINK_STATUS), SW_HIDE);
-	ShowWindow(GetDlgItem(m_hDlg, IDC_STATIC_STATUS), SW_SHOW);
+	HWND edit = GetDlgItem(m_hDlg, editId);
 
-	m_AwaitingSearchItems.clear();
-	m_SearchItemsMapInternal.clear();
-
-	ListView_DeleteAllItems(GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS));
-
-	TCHAR szBaseDirectory[MAX_PATH];
-	TCHAR szSearchPattern[MAX_PATH];
-
-	/* Get the directory and name, and remove leading and
-	trailing whitespace. */
-	GetDlgItemText(m_hDlg, IDC_COMBO_DIRECTORY, szBaseDirectory, std::size(szBaseDirectory));
-	PathRemoveBlanks(szBaseDirectory);
-	GetDlgItemText(m_hDlg, IDC_COMBO_NAME, szSearchPattern, std::size(szSearchPattern));
-	PathRemoveBlanks(szSearchPattern);
-
-	BOOL bSearchSubFolders = IsDlgButtonChecked(m_hDlg, IDC_CHECK_SEARCHSUBFOLDERS) == BST_CHECKED;
-
-	BOOL bUseRegularExpressions =
-		IsDlgButtonChecked(m_hDlg, IDC_CHECK_USEREGULAREXPRESSIONS) == BST_CHECKED;
-
-	BOOL bCaseInsensitive = IsDlgButtonChecked(m_hDlg, IDC_CHECK_CASEINSENSITIVE) == BST_CHECKED;
-
-	/* Turn search patterns of the form '???' into '*???*', and
-	use this modified string to search. */
-	if (!bUseRegularExpressions && lstrlen(szSearchPattern) > 0)
+	if (!edit)
 	{
-		if (szSearchPattern[0] != '*' && szSearchPattern[lstrlen(szSearchPattern) - 1] != '*')
-		{
-			TCHAR szTemp[MAX_PATH];
+		return std::nullopt;
+	}
 
-			StringCchPrintf(szTemp, std::size(szTemp), _T("*%s*"), szSearchPattern);
-			StringCchCopy(szSearchPattern, std::size(szSearchPattern), szTemp);
+	auto text = GetDlgItemString(m_hDlg, editId);
+	TrimString(text, L" ");
+
+	if (text.empty())
+	{
+		return std::nullopt;
+	}
+
+	wchar_t *end = nullptr;
+	double value = wcstod(text.c_str(), &end);
+
+	if (end == text.c_str() || value < 0)
+	{
+		return std::nullopt;
+	}
+
+	uint64_t multiplier = 1024 * 1024;
+
+	if (HWND unitCombo = GetDlgItem(m_hDlg, unitId))
+	{
+		switch (ComboBox_GetCurSel(unitCombo))
+		{
+		case 0:
+			multiplier = 1024;
+			break;
+
+		case 2:
+			multiplier = 1024ull * 1024 * 1024;
+			break;
 		}
 	}
 
-	DWORD dwAttributes = 0;
+	return static_cast<uint64_t>(value * static_cast<double>(multiplier));
+}
+
+std::optional<FILETIME> SearchDialog::GetDateFilterValue(int dateTimePickerId, bool endOfDay)
+{
+	HWND dateTimePicker = GetDlgItem(m_hDlg, dateTimePickerId);
+
+	if (!dateTimePicker)
+	{
+		return std::nullopt;
+	}
+
+	SYSTEMTIME localTime;
+
+	if (DateTime_GetSystemtime(dateTimePicker, &localTime) != GDT_VALID)
+	{
+		return std::nullopt;
+	}
+
+	// Only the date part is relevant.
+	localTime.wHour = 0;
+	localTime.wMinute = 0;
+	localTime.wSecond = 0;
+	localTime.wMilliseconds = 0;
+
+	FILETIME localFileTime;
+
+	if (!SystemTimeToFileTime(&localTime, &localFileTime))
+	{
+		return std::nullopt;
+	}
+
+	if (endOfDay)
+	{
+		// The "before" date is inclusive, so the limit is the start of the following day.
+		ULARGE_INTEGER time = { { localFileTime.dwLowDateTime, localFileTime.dwHighDateTime } };
+		time.QuadPart += 24ull * 60 * 60 * 10'000'000;
+		localFileTime.dwLowDateTime = time.LowPart;
+		localFileTime.dwHighDateTime = time.HighPart;
+	}
+
+	FILETIME utcFileTime;
+
+	if (!LocalFileTimeToFileTime(&localFileTime, &utcFileTime))
+	{
+		return std::nullopt;
+	}
+
+	return utcFileTime;
+}
+
+std::optional<SearchParameters> SearchDialog::BuildSearchParameters()
+{
+	SearchParameters parameters;
+
+	parameters.baseDirectory = GetDlgItemString(m_hDlg, IDC_COMBO_DIRECTORY);
+	TrimString(parameters.baseDirectory, L" ");
+
+	parameters.pattern = GetDlgItemString(m_hDlg, IDC_COMBO_NAME);
+	TrimString(parameters.pattern, L" ");
+
+	if (parameters.baseDirectory.empty())
+	{
+		return std::nullopt;
+	}
+
+	parameters.searchSubFolders =
+		IsDlgButtonChecked(m_hDlg, IDC_CHECK_SEARCHSUBFOLDERS) == BST_CHECKED;
+	parameters.useRegularExpressions =
+		IsDlgButtonChecked(m_hDlg, IDC_CHECK_USEREGULAREXPRESSIONS) == BST_CHECKED;
+	parameters.caseInsensitive =
+		IsDlgButtonChecked(m_hDlg, IDC_CHECK_CASEINSENSITIVE) == BST_CHECKED;
 
 	if (IsDlgButtonChecked(m_hDlg, IDC_CHECK_ARCHIVE) == BST_CHECKED)
 	{
-		dwAttributes |= FILE_ATTRIBUTE_ARCHIVE;
+		parameters.attributes |= FILE_ATTRIBUTE_ARCHIVE;
 	}
 
 	if (IsDlgButtonChecked(m_hDlg, IDC_CHECK_HIDDEN) == BST_CHECKED)
 	{
-		dwAttributes |= FILE_ATTRIBUTE_HIDDEN;
+		parameters.attributes |= FILE_ATTRIBUTE_HIDDEN;
 	}
 
 	if (IsDlgButtonChecked(m_hDlg, IDC_CHECK_READONLY) == BST_CHECKED)
 	{
-		dwAttributes |= FILE_ATTRIBUTE_READONLY;
+		parameters.attributes |= FILE_ATTRIBUTE_READONLY;
 	}
 
 	if (IsDlgButtonChecked(m_hDlg, IDC_CHECK_SYSTEM) == BST_CHECKED)
 	{
-		dwAttributes |= FILE_ATTRIBUTE_SYSTEM;
+		parameters.attributes |= FILE_ATTRIBUTE_SYSTEM;
 	}
 
-	m_pSearch = new Search(m_hDlg, szBaseDirectory, szSearchPattern, dwAttributes,
-		bUseRegularExpressions, bCaseInsensitive, bSearchSubFolders);
-	m_pSearch->AddRef();
+	if (HWND itemTypeCombo = GetDlgItem(m_hDlg, IDC_SEARCH_ITEM_TYPE))
+	{
+		switch (ComboBox_GetCurSel(itemTypeCombo))
+		{
+		case 1:
+			parameters.itemType = SearchItemType::FilesOnly;
+			break;
+
+		case 2:
+			parameters.itemType = SearchItemType::FoldersOnly;
+			break;
+		}
+	}
+
+	parameters.minSize = GetSizeFilterValue(IDC_SEARCH_MIN_SIZE, IDC_SEARCH_MIN_SIZE_UNIT);
+	parameters.maxSize = GetSizeFilterValue(IDC_SEARCH_MAX_SIZE, IDC_SEARCH_MAX_SIZE_UNIT);
+	parameters.modifiedAfter = GetDateFilterValue(IDC_SEARCH_MODIFIED_AFTER, false);
+	parameters.modifiedBefore = GetDateFilterValue(IDC_SEARCH_MODIFIED_BEFORE, true);
+
+	return parameters;
+}
+
+void SearchDialog::StartSearching()
+{
+	auto parameters = BuildSearchParameters();
+
+	if (!parameters)
+	{
+		return;
+	}
+
+	ShowWindow(GetDlgItem(m_hDlg, IDC_LINK_STATUS), SW_HIDE);
+	ShowWindow(GetDlgItem(m_hDlg, IDC_STATIC_STATUS), SW_SHOW);
+
+	m_results.clear();
+	m_directories.clear();
+	m_displayOrder.clear();
+	m_sortPending = false;
+
+	HWND listView = GetResultsListView();
+	ListView_SetItemState(listView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+	ListView_SetItemCountEx(listView, 0, 0);
 
 	/* Save the search directory and search pattern (only if they are not
 	the same as the most recent entry). */
-	BOOL bSaveEntry = FALSE;
-
 	if (m_persistentSettings->m_searchDirectories.empty()
-		|| lstrcmp(szBaseDirectory, m_persistentSettings->m_searchDirectories.begin()->c_str())
-			!= 0)
-	{
-		bSaveEntry = TRUE;
-	}
-
-	if (bSaveEntry)
+		|| parameters->baseDirectory != *m_persistentSettings->m_searchDirectories.begin())
 	{
 		SaveEntry(IDC_COMBO_DIRECTORY, m_persistentSettings->m_searchDirectories);
 	}
 
-	bSaveEntry = FALSE;
+	auto patternText = GetDlgItemString(m_hDlg, IDC_COMBO_NAME);
 
 	if (m_persistentSettings->m_searchPatterns.empty()
-		|| lstrcmp(szSearchPattern, m_persistentSettings->m_searchPatterns.begin()->c_str()) != 0)
-	{
-		bSaveEntry = TRUE;
-	}
-
-	if (bSaveEntry)
+		|| patternText != *m_persistentSettings->m_searchPatterns.begin())
 	{
 		SaveEntry(IDC_COMBO_NAME, m_persistentSettings->m_searchPatterns);
 	}
@@ -361,12 +919,20 @@ void SearchDialog::StartSearching()
 	auto stopText = m_resourceLoader->LoadString(IDS_STOP);
 	SetDlgItemText(m_hDlg, IDSEARCH, stopText.c_str());
 
-	m_bSearching = TRUE;
+	m_searching = true;
 
-	/* Create a background thread, and search using it... */
-	HANDLE hThread = CreateThread(nullptr, 0, NSearchDialog::SearchThread,
-		reinterpret_cast<LPVOID>(m_pSearch), 0, nullptr);
-	CloseHandle(hThread);
+	m_searchState = std::make_shared<SearchSharedState>();
+	m_searchState->notifyWindow = m_hDlg;
+
+	// The thread is detached. It holds its own reference to the shared state, so it's safe for the
+	// dialog to be destroyed while the thread is still running. In that case, the thread will
+	// stop at the next opportunity and won't post any further messages.
+	std::thread([worker = std::make_shared<SearchWorker>(std::move(*parameters), m_searchState)]()
+		{ worker->Run(); })
+		.detach();
+
+	SetTimer(m_hDlg, STATUS_UPDATE_TIMER_ID, STATUS_UPDATE_TIMER_ELAPSED, nullptr);
+	UpdateSearchingStatus();
 }
 
 void SearchDialog::SaveEntry(int comboBoxId, boost::circular_buffer<std::wstring> &buffer)
@@ -405,22 +971,573 @@ void SearchDialog::SaveEntry(int comboBoxId, boost::circular_buffer<std::wstring
 
 void SearchDialog::StopSearching()
 {
-	m_bStopSearching = TRUE;
-
-	if (m_pSearch != nullptr)
+	if (!m_searchState)
 	{
-		/* Note that m_pSearch does not need to be
-		released here. Once the search object finishes,
-		it will send a WM_APP_SEARCHFINISHED message.
-		The handler for this message will then release
-		m_pSearch. */
-		m_pSearch->StopSearching();
+		return;
 	}
+
+	// The finished notification will still be posted by the search thread (unless the dialog is
+	// being destroyed), at which point the UI will be updated.
+	m_searchState->stopRequested = true;
+}
+
+INT_PTR SearchDialog::OnDestroy()
+{
+	KillTimer(m_hDlg, STATUS_UPDATE_TIMER_ID);
+
+	if (m_searchState)
+	{
+		std::scoped_lock lock(m_searchState->mutex);
+		m_searchState->notifyWindow = nullptr;
+		m_searchState->stopRequested = true;
+	}
+
+	return 0;
+}
+
+INT_PTR SearchDialog::OnPrivateMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	UNREFERENCED_PARAMETER(wParam);
+	UNREFERENCED_PARAMETER(lParam);
+
+	switch (uMsg)
+	{
+	case WM_APP_SEARCH_RESULTS_AVAILABLE:
+		OnResultsAvailable();
+		break;
+
+	case WM_APP_SEARCH_FINISHED:
+		OnSearchFinished();
+		break;
+	}
+
+	return 0;
+}
+
+void SearchDialog::OnResultsAvailable()
+{
+	if (!m_searchState)
+	{
+		return;
+	}
+
+	std::vector<SearchResult> newResults;
+	std::vector<std::wstring> newDirectories;
+
+	{
+		std::scoped_lock lock(m_searchState->mutex);
+		newResults.swap(m_searchState->pendingResults);
+		newDirectories.swap(m_searchState->pendingDirectories);
+		m_searchState->resultsNotificationPending = false;
+	}
+
+	if (newResults.empty())
+	{
+		return;
+	}
+
+	m_directories.insert(m_directories.end(), std::make_move_iterator(newDirectories.begin()),
+		std::make_move_iterator(newDirectories.end()));
+
+	size_t firstNewIndex = m_results.size();
+	m_results.insert(m_results.end(), std::make_move_iterator(newResults.begin()),
+		std::make_move_iterator(newResults.end()));
+
+	for (size_t i = firstNewIndex; i < m_results.size(); i++)
+	{
+		m_displayOrder.push_back(i);
+	}
+
+	// Results are appended while the search is in progress (so that the items the user is looking
+	// at don't move around). They're sorted once the search has finished.
+	m_sortPending = true;
+
+	ListView_SetItemCountEx(GetResultsListView(), static_cast<int>(m_displayOrder.size()),
+		LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+}
+
+void SearchDialog::OnSearchFinished()
+{
+	if (!m_searchState)
+	{
+		return;
+	}
+
+	// Pick up any results that haven't been processed yet.
+	OnResultsAvailable();
+
+	KillTimer(m_hDlg, STATUS_UPDATE_TIMER_ID);
+
+	bool stopped;
+	bool regularExpressionInvalid;
+	int foldersFound;
+	int filesFound;
+
+	{
+		std::scoped_lock lock(m_searchState->mutex);
+		stopped = m_searchState->stopRequested;
+		regularExpressionInvalid = m_searchState->regularExpressionInvalid;
+		foldersFound = m_searchState->foldersFound;
+		filesFound = m_searchState->filesFound;
+	}
+
+	m_searchState.reset();
+
+	if (regularExpressionInvalid)
+	{
+		/* The link/status controls are in the same position, and
+		have the same size. If one of the controls is showing text,
+		the other should not be visible. */
+		ShowWindow(GetDlgItem(m_hDlg, IDC_LINK_STATUS), SW_SHOW);
+		ShowWindow(GetDlgItem(m_hDlg, IDC_STATIC_STATUS), SW_HIDE);
+
+		auto errorMessage = m_resourceLoader->LoadString(IDS_SEARCH_REGULAR_EXPRESSION_INVALID);
+		SetDlgItemText(m_hDlg, IDC_LINK_STATUS, errorMessage.c_str());
+	}
+	else if (stopped)
+	{
+		auto cancelledMessage = m_resourceLoader->LoadString(IDS_SEARCH_CANCELLED_MESSAGE);
+		SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, cancelledMessage.c_str());
+	}
+	else
+	{
+		TCHAR szStatus[512];
+		auto messageTemplate = m_resourceLoader->LoadString(IDS_SEARCH_FINISHED_MESSAGE);
+		StringCchPrintf(szStatus, std::size(szStatus), messageTemplate.c_str(), foldersFound,
+			filesFound);
+		SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, szStatus);
+	}
+
+	if (m_sortPending)
+	{
+		SortResults();
+	}
+
+	m_searching = false;
+	SetDlgItemText(m_hDlg, IDSEARCH, m_szSearchButton);
+}
+
+void SearchDialog::UpdateSearchingStatus()
+{
+	if (!m_searchState)
+	{
+		return;
+	}
+
+	std::wstring currentDirectory;
+
+	{
+		std::scoped_lock lock(m_searchState->mutex);
+		currentDirectory = m_searchState->currentDirectory;
+	}
+
+	TCHAR szStatus[512];
+	auto messageTemplate = m_resourceLoader->LoadString(IDS_SEARCHING);
+	StringCchPrintf(szStatus, std::size(szStatus), messageTemplate.c_str(),
+		currentDirectory.c_str());
+
+	std::wstring status = std::format(L"{} ({:L})", szStatus, m_results.size());
+	SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, status.c_str());
+}
+
+INT_PTR SearchDialog::OnTimer(int iTimerID)
+{
+	if (iTimerID != STATUS_UPDATE_TIMER_ID)
+	{
+		return 1;
+	}
+
+	UpdateSearchingStatus();
+
+	return 0;
+}
+
+INT_PTR SearchDialog::OnClose()
+{
+	DestroyWindow(m_hDlg);
+
+	return 0;
+}
+
+HWND SearchDialog::GetResultsListView() const
+{
+	return GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
+}
+
+std::optional<size_t> SearchDialog::GetResultAtListIndex(int index) const
+{
+	if (index < 0 || static_cast<size_t>(index) >= m_displayOrder.size())
+	{
+		return std::nullopt;
+	}
+
+	return m_displayOrder[index];
+}
+
+std::vector<size_t> SearchDialog::GetSelectedResults() const
+{
+	std::vector<size_t> selectedResults;
+	HWND listView = GetResultsListView();
+	int index = -1;
+
+	while ((index = ListView_GetNextItem(listView, index, LVNI_SELECTED)) != -1)
+	{
+		if (auto result = GetResultAtListIndex(index))
+		{
+			selectedResults.push_back(*result);
+		}
+	}
+
+	return selectedResults;
+}
+
+std::wstring SearchDialog::GetResultPath(size_t resultIndex) const
+{
+	const auto &result = m_results[resultIndex];
+	std::wstring path = m_directories[result.directoryIndex];
+
+	if (!path.empty() && path.back() != '\\')
+	{
+		path += '\\';
+	}
+
+	path += result.name;
+	return path;
+}
+
+std::vector<PidlAbsolute> SearchDialog::GetPidlsForResults(const std::vector<size_t> &items) const
+{
+	std::vector<PidlAbsolute> pidls;
+
+	for (size_t item : items)
+	{
+		PidlAbsolute pidl;
+		HRESULT hr = SHParseDisplayName(GetResultPath(item).c_str(), nullptr, PidlOutParam(pidl), 0,
+			nullptr);
+
+		if (SUCCEEDED(hr))
+		{
+			pidls.push_back(std::move(pidl));
+		}
+	}
+
+	return pidls;
+}
+
+const SearchDialog::TypeInfo &SearchDialog::GetTypeInfo(const SearchResult &result) const
+{
+	bool isFolder = WI_IsFlagSet(result.attributes, FILE_ATTRIBUTE_DIRECTORY);
+
+	// The type name and generic icon are determined by the extension, so they're cached per
+	// extension. That avoids touching each individual file.
+	std::wstring key;
+
+	if (isFolder)
+	{
+		key = L"\\folder";
+	}
+	else
+	{
+		key = PathFindExtension(result.name.c_str());
+		std::transform(key.begin(), key.end(), key.begin(), towlower);
+	}
+
+	auto itr = m_typeInfoCache.find(key);
+
+	if (itr != m_typeInfoCache.end())
+	{
+		return itr->second;
+	}
+
+	SHFILEINFO shfi = {};
+	std::wstring fileName = isFolder ? L"folder" : L"file" + key;
+	SHGetFileInfo(fileName.c_str(), isFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+		&shfi, sizeof(shfi), SHGFI_USEFILEATTRIBUTES | SHGFI_TYPENAME | SHGFI_SYSICONINDEX);
+
+	auto [insertedItr, inserted] =
+		m_typeInfoCache.emplace(key, TypeInfo{ shfi.szTypeName, shfi.iIcon });
+	return insertedItr->second;
+}
+
+int SearchDialog::GetIconIndex(SearchResult &result)
+{
+	if (result.iconIndex != -1)
+	{
+		return result.iconIndex;
+	}
+
+	bool isFolder = WI_IsFlagSet(result.attributes, FILE_ATTRIBUTE_DIRECTORY);
+
+	if (!isFolder && ResultHasPerFileIcon(result.name))
+	{
+		SHFILEINFO shfi = {};
+		auto path = GetResultPath(&result - m_results.data());
+
+		if (SHGetFileInfo(path.c_str(), 0, &shfi, sizeof(shfi), SHGFI_SYSICONINDEX))
+		{
+			result.iconIndex = shfi.iIcon;
+			return result.iconIndex;
+		}
+	}
+
+	result.iconIndex = GetTypeInfo(result).iconIndex;
+	return result.iconIndex;
+}
+
+std::wstring SearchDialog::GetColumnText(const SearchResult &result, int column) const
+{
+	switch (static_cast<ResultsColumn>(column))
+	{
+	case ResultsColumn::Name:
+		return result.name;
+
+	case ResultsColumn::Path:
+		return m_directories[result.directoryIndex];
+
+	case ResultsColumn::Size:
+		if (WI_IsFlagSet(result.attributes, FILE_ATTRIBUTE_DIRECTORY))
+		{
+			return {};
+		}
+
+		return FormatSizeString(result.size);
+
+	case ResultsColumn::DateModified:
+	{
+		TCHAR dateText[128];
+
+		if (!CreateFileTimeString(&result.lastModified, dateText, std::size(dateText), FALSE))
+		{
+			return {};
+		}
+
+		return dateText;
+	}
+
+	case ResultsColumn::Type:
+		return GetTypeInfo(result).typeName;
+	}
+
+	return {};
+}
+
+void SearchDialog::OnGetDisplayInfo(NMLVDISPINFO *dispInfo)
+{
+	auto resultIndex = GetResultAtListIndex(dispInfo->item.iItem);
+
+	if (!resultIndex)
+	{
+		return;
+	}
+
+	auto &result = m_results[*resultIndex];
+
+	if (WI_IsFlagSet(dispInfo->item.mask, LVIF_TEXT))
+	{
+		auto text = GetColumnText(result, dispInfo->item.iSubItem);
+		StringCchCopy(dispInfo->item.pszText, dispInfo->item.cchTextMax, text.c_str());
+	}
+
+	if (WI_IsFlagSet(dispInfo->item.mask, LVIF_IMAGE))
+	{
+		dispInfo->item.iImage = GetIconIndex(result);
+	}
+
+	if (WI_IsFlagSet(dispInfo->item.mask, LVIF_STATE))
+	{
+		// Hidden items are shown ghosted, as they are in the main listview.
+		if (WI_IsFlagSet(result.attributes, FILE_ATTRIBUTE_HIDDEN))
+		{
+			dispInfo->item.state |= LVIS_CUT;
+			dispInfo->item.stateMask |= LVIS_CUT;
+		}
+	}
+}
+
+// Supports type-ahead navigation within the results (typing the start of a name selects the
+// first matching item).
+int SearchDialog::OnFindItem(const NMLVFINDITEM *findItem)
+{
+	if (WI_IsFlagClear(findItem->lvfi.flags, LVFI_STRING)
+		&& WI_IsFlagClear(findItem->lvfi.flags, LVFI_PARTIAL))
+	{
+		return -1;
+	}
+
+	if (!findItem->lvfi.psz)
+	{
+		return -1;
+	}
+
+	size_t searchLength = lstrlen(findItem->lvfi.psz);
+	int numItems = static_cast<int>(m_displayOrder.size());
+
+	if (numItems == 0)
+	{
+		return -1;
+	}
+
+	int startIndex = std::clamp(findItem->iStart, 0, numItems - 1);
+
+	for (int offset = 0; offset < numItems; offset++)
+	{
+		int index = (startIndex + offset) % numItems;
+
+		if (offset > 0 && index == 0 && WI_IsFlagClear(findItem->lvfi.flags, LVFI_WRAP))
+		{
+			break;
+		}
+
+		const auto &name = m_results[m_displayOrder[index]].name;
+
+		if (CompareString(LOCALE_USER_DEFAULT, NORM_IGNORECASE, name.c_str(),
+				static_cast<int>(std::min(name.size(), searchLength)), findItem->lvfi.psz,
+				static_cast<int>(searchLength))
+			== CSTR_EQUAL)
+		{
+			return index;
+		}
+	}
+
+	return -1;
+}
+
+int SearchDialog::CompareResults(const SearchResult &result1, const SearchResult &result2) const
+{
+	int comparison = 0;
+
+	switch (m_persistentSettings->m_SortMode)
+	{
+	case SearchDialogPersistentSettings::SortMode::Name:
+		comparison = StrCmpLogicalW(result1.name.c_str(), result2.name.c_str());
+		break;
+
+	case SearchDialogPersistentSettings::SortMode::Path:
+		comparison = StrCmpLogicalW(m_directories[result1.directoryIndex].c_str(),
+			m_directories[result2.directoryIndex].c_str());
+		break;
+
+	case SearchDialogPersistentSettings::SortMode::Size:
+	{
+		// Folders are always placed together, before files.
+		bool isFolder1 = WI_IsFlagSet(result1.attributes, FILE_ATTRIBUTE_DIRECTORY);
+		bool isFolder2 = WI_IsFlagSet(result2.attributes, FILE_ATTRIBUTE_DIRECTORY);
+
+		if (isFolder1 != isFolder2)
+		{
+			comparison = isFolder1 ? -1 : 1;
+		}
+		else if (result1.size != result2.size)
+		{
+			comparison = result1.size < result2.size ? -1 : 1;
+		}
+	}
+	break;
+
+	case SearchDialogPersistentSettings::SortMode::DateModified:
+		comparison = CompareFileTime(&result1.lastModified, &result2.lastModified);
+		break;
+
+	case SearchDialogPersistentSettings::SortMode::Type:
+		comparison = StrCmpLogicalW(GetTypeInfo(result1).typeName.c_str(),
+			GetTypeInfo(result2).typeName.c_str());
+		break;
+	}
+
+	// Items that are otherwise equal are ordered by name, then by path, so that the order is
+	// always well-defined.
+	if (comparison == 0)
+	{
+		comparison = StrCmpLogicalW(result1.name.c_str(), result2.name.c_str());
+	}
+
+	if (comparison == 0)
+	{
+		comparison = StrCmpLogicalW(m_directories[result1.directoryIndex].c_str(),
+			m_directories[result2.directoryIndex].c_str());
+	}
+
+	if (!m_persistentSettings->m_bSortAscending)
+	{
+		comparison = -comparison;
+	}
+
+	return comparison;
+}
+
+void SearchDialog::SortResults()
+{
+	HWND listView = GetResultsListView();
+
+	// The selection (and focused item) is tracked by index in a virtual listview, so it needs to
+	// be remapped after sorting.
+	auto selectedResults = GetSelectedResults();
+	auto focusedResult = GetResultAtListIndex(ListView_GetNextItem(listView, -1, LVNI_FOCUSED));
+
+	std::stable_sort(m_displayOrder.begin(), m_displayOrder.end(),
+		[this](size_t index1, size_t index2)
+		{ return CompareResults(m_results[index1], m_results[index2]) < 0; });
+
+	m_sortPending = false;
+
+	ListView_SetItemState(listView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+
+	if (!selectedResults.empty() || focusedResult)
+	{
+		std::unordered_set<size_t> selectedSet(selectedResults.begin(), selectedResults.end());
+
+		for (size_t i = 0; i < m_displayOrder.size(); i++)
+		{
+			UINT state = 0;
+
+			if (selectedSet.contains(m_displayOrder[i]))
+			{
+				state |= LVIS_SELECTED;
+			}
+
+			if (focusedResult && m_displayOrder[i] == *focusedResult)
+			{
+				state |= LVIS_FOCUSED;
+			}
+
+			if (state != 0)
+			{
+				ListView_SetItemState(listView, static_cast<int>(i), state, state);
+			}
+		}
+	}
+
+	InvalidateRect(listView, nullptr, false);
+	UpdateListViewHeader();
+}
+
+void SearchDialog::OnColumnClicked(int column)
+{
+	if (column < 0 || static_cast<size_t>(column) >= m_persistentSettings->m_Columns.size())
+	{
+		return;
+	}
+
+	const auto &columnInfo = m_persistentSettings->m_Columns[column];
+
+	/* If the column clicked matches the current sort mode,
+	flip the sort direction, else switch to that sort mode. */
+	if (columnInfo.sortMode == m_persistentSettings->m_SortMode)
+	{
+		m_persistentSettings->m_bSortAscending = !m_persistentSettings->m_bSortAscending;
+	}
+	else
+	{
+		m_persistentSettings->m_SortMode = columnInfo.sortMode;
+		m_persistentSettings->m_bSortAscending = columnInfo.bSortAscending;
+	}
+
+	SortResults();
 }
 
 void SearchDialog::UpdateListViewHeader()
 {
-	HWND hHeader = ListView_GetHeader(GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS));
+	HWND hHeader = ListView_GetHeader(GetResultsListView());
 
 	HDITEM hdItem;
 
@@ -430,16 +1547,7 @@ void SearchDialog::UpdateListViewHeader()
 	{
 		hdItem.mask = HDI_FORMAT;
 		Header_GetItem(hHeader, m_iPreviousSelectedColumn, &hdItem);
-
-		if (hdItem.fmt & HDF_SORTUP)
-		{
-			hdItem.fmt &= ~HDF_SORTUP;
-		}
-		else if (hdItem.fmt & HDF_SORTDOWN)
-		{
-			hdItem.fmt &= ~HDF_SORTDOWN;
-		}
-
+		hdItem.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
 		Header_SetItem(hHeader, m_iPreviousSelectedColumn, &hdItem);
 	}
 
@@ -472,583 +1580,451 @@ void SearchDialog::UpdateListViewHeader()
 	m_iPreviousSelectedColumn = iColumn;
 }
 
-int CALLBACK NSearchDialog::SortResultsStub(LPARAM lParam1, LPARAM lParam2, LPARAM lParamSort)
+void SearchDialog::OpenResults(const std::vector<size_t> &items)
 {
-	assert(lParamSort != NULL);
+	auto *browser = m_browserList->GetLastActive();
 
-	auto *psd = reinterpret_cast<SearchDialog *>(lParamSort);
-
-	return psd->SortResults(lParam1, lParam2);
-}
-
-int CALLBACK SearchDialog::SortResults(LPARAM lParam1, LPARAM lParam2)
-{
-	int iRes = 0;
-
-	switch (m_persistentSettings->m_SortMode)
+	if (!browser)
 	{
-	case SearchDialogPersistentSettings::SortMode::Name:
-		iRes = SortResultsByName(lParam1, lParam2);
-		break;
-
-	case SearchDialogPersistentSettings::SortMode::Path:
-		iRes = SortResultsByPath(lParam1, lParam2);
-		break;
+		return;
 	}
 
-	if (!m_persistentSettings->m_bSortAscending)
+	size_t numOpened = 0;
+
+	for (size_t item : items)
 	{
-		iRes = -iRes;
+		if (numOpened == MAX_ITEMS_TO_OPEN)
+		{
+			break;
+		}
+
+		browser->OpenItem(GetResultPath(item).c_str());
+		numOpened++;
+	}
+}
+
+void SearchDialog::OpenResultLocation(size_t resultIndex)
+{
+	auto *browser = m_browserList->GetLastActive();
+
+	if (!browser)
+	{
+		return;
 	}
 
-	return iRes;
+	const auto &directory = m_directories[m_results[resultIndex].directoryIndex];
+
+	PidlAbsolute directoryPidl;
+	HRESULT hr =
+		SHParseDisplayName(directory.c_str(), nullptr, PidlOutParam(directoryPidl), 0, nullptr);
+
+	if (FAILED(hr))
+	{
+		return;
+	}
+
+	auto navigateParams = NavigateParams::Normal(directoryPidl.Raw());
+
+	// The item itself is selected once the folder has been opened.
+	auto itemPidls = GetPidlsForResults({ resultIndex });
+	navigateParams.itemsToSelect = itemPidls;
+
+	browser->GetActiveShellBrowser()->GetNavigationController()->Navigate(navigateParams);
+
+	SetForegroundWindow(browser->GetView()->GetHWND());
 }
 
-int CALLBACK SearchDialog::SortResultsByName(LPARAM lParam1, LPARAM lParam2)
+void SearchDialog::CopyResultsToClipboard(const std::vector<size_t> &items, bool cut)
 {
-	auto itr1 = m_SearchItemsMapInternal.find(static_cast<int>(lParam1));
-	auto itr2 = m_SearchItemsMapInternal.find(static_cast<int>(lParam2));
+	auto pidls = GetPidlsForResults(items);
 
-	TCHAR szFilename1[MAX_PATH];
-	TCHAR szFilename2[MAX_PATH];
+	if (pidls.empty())
+	{
+		return;
+	}
 
-	StringCchCopy(szFilename1, std::size(szFilename1), itr1->second.c_str());
-	StringCchCopy(szFilename2, std::size(szFilename2), itr2->second.c_str());
-
-	PathStripPath(szFilename1);
-	PathStripPath(szFilename2);
-
-	return StrCmpLogicalW(szFilename1, szFilename2);
+	wil::com_ptr_nothrow<IDataObject> dataObject;
+	CopyFilesToClipboard(m_clipboardStore, pidls,
+		cut ? ClipboardAction::Cut : ClipboardAction::Copy, &dataObject);
 }
 
-int CALLBACK SearchDialog::SortResultsByPath(LPARAM lParam1, LPARAM lParam2)
+void SearchDialog::CopyResultPathsToClipboard(const std::vector<size_t> &items)
 {
-	auto itr1 = m_SearchItemsMapInternal.find(static_cast<int>(lParam1));
-	auto itr2 = m_SearchItemsMapInternal.find(static_cast<int>(lParam2));
+	std::wstring paths;
 
-	TCHAR szPath1[MAX_PATH];
-	TCHAR szPath2[MAX_PATH];
+	for (size_t item : items)
+	{
+		if (!paths.empty())
+		{
+			paths += L"\r\n";
+		}
 
-	StringCchCopy(szPath1, std::size(szPath1), itr1->second.c_str());
-	StringCchCopy(szPath2, std::size(szPath2), itr2->second.c_str());
+		paths += GetResultPath(item);
+	}
 
-	PathRemoveFileSpec(szPath1);
-	PathRemoveFileSpec(szPath2);
+	if (paths.empty())
+	{
+		return;
+	}
 
-	return StrCmpLogicalW(szPath1, szPath2);
+	BulkClipboardWriter clipboardWriter(m_clipboardStore);
+	clipboardWriter.WriteText(paths);
+}
+
+void SearchDialog::DeleteResults(const std::vector<size_t> &items, bool permanent)
+{
+	auto pidls = GetPidlsForResults(items);
+
+	if (pidls.empty())
+	{
+		return;
+	}
+
+	std::vector<PCIDLIST_ABSOLUTE> rawPidls;
+
+	for (const auto &pidl : pidls)
+	{
+		rawPidls.push_back(pidl.Raw());
+	}
+
+	FileOperations::DeleteFiles(m_hDlg, rawPidls, permanent, false);
+
+	RemoveResultsThatNoLongerExist(items);
+}
+
+// Removes any of the specified results whose underlying item no longer exists (e.g. because it
+// was deleted from the results list).
+void SearchDialog::RemoveResultsThatNoLongerExist(const std::vector<size_t> &items)
+{
+	std::unordered_set<size_t> removedResults;
+
+	for (size_t item : items)
+	{
+		if (GetFileAttributes(GetResultPath(item).c_str()) == INVALID_FILE_ATTRIBUTES)
+		{
+			removedResults.insert(item);
+		}
+	}
+
+	if (removedResults.empty())
+	{
+		return;
+	}
+
+	// Only the display order is updated. The result data itself remains in m_results, which
+	// means that existing indexes into that vector remain valid.
+	std::erase_if(m_displayOrder,
+		[&removedResults](size_t index) { return removedResults.contains(index); });
+
+	HWND listView = GetResultsListView();
+	ListView_SetItemState(listView, -1, 0, LVIS_SELECTED);
+	ListView_SetItemCountEx(listView, static_cast<int>(m_displayOrder.size()), 0);
+	InvalidateRect(listView, nullptr, false);
+}
+
+void SearchDialog::StartDraggingResults(const std::vector<size_t> &items)
+{
+	auto pidls = GetPidlsForResults(items);
+
+	if (pidls.empty())
+	{
+		return;
+	}
+
+	std::vector<PCIDLIST_ABSOLUTE> rawPidls;
+
+	for (const auto &pidl : pidls)
+	{
+		rawPidls.push_back(pidl.Raw());
+	}
+
+	StartDragForShellItems(rawPidls);
+
+	// The items may have been moved as part of the drag.
+	RemoveResultsThatNoLongerExist(items);
+}
+
+void SearchDialog::SelectAllResults()
+{
+	ListView_SetItemState(GetResultsListView(), -1, LVIS_SELECTED, LVIS_SELECTED);
+}
+
+void SearchDialog::ShowContextMenu(const POINT &ptScreen)
+{
+	auto selectedResults = GetSelectedResults();
+
+	if (selectedResults.empty())
+	{
+		return;
+	}
+
+	auto pidls = GetPidlsForResults(selectedResults);
+
+	if (pidls.size() != selectedResults.size())
+	{
+		return;
+	}
+
+	// The full shell context menu can only be shown for items that are in the same folder.
+	auto parent = pidls[0];
+	bool parentRemoved = parent.RemoveLastItem();
+	DCHECK(parentRemoved);
+
+	std::vector<PidlChild> children;
+	bool sameParent = true;
+
+	for (const auto &pidl : pidls)
+	{
+		auto currentParent = pidl;
+		currentParent.RemoveLastItem();
+
+		if (!(currentParent == parent))
+		{
+			sameParent = false;
+			break;
+		}
+
+		children.push_back(pidl.GetLastItem());
+	}
+
+	if (!sameParent)
+	{
+		ShowMixedLocationsContextMenu(ptScreen, selectedResults);
+		return;
+	}
+
+	ShellItemContextMenu::Flags flags = ShellItemContextMenu::Flags::None;
+
+	if (IsKeyDown(VK_SHIFT))
+	{
+		WI_SetFlag(flags, ShellItemContextMenu::Flags::ExtendedVerbs);
+	}
+
+	PopupMenuView popupMenu(m_hDlg, NoOpMenuHelpTextHost::GetInstance());
+	SearchResultsItemContextMenu menu(&popupMenu, m_acceleratorManager, parent, children, nullptr,
+		flags, m_browserList, m_resourceLoader);
+	popupMenu.Show(ptScreen);
+
+	// Items may have been deleted or moved via the context menu.
+	RemoveResultsThatNoLongerExist(selectedResults);
+}
+
+// When the selected items are spread across multiple folders, the standard shell context menu
+// can't be used. In that case, a menu containing the most common operations is shown instead.
+// These operations all work with items from different folders.
+void SearchDialog::ShowMixedLocationsContextMenu(const POINT &ptScreen,
+	const std::vector<size_t> &items)
+{
+	PopupMenuView popupMenu(m_hDlg, NoOpMenuHelpTextHost::GetInstance());
+
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_APPLICATION_CONTEXT_MENU_OPEN))
+			.SetSelectedCallback([this, items] { OpenResults(items); }));
+
+	auto focusedResult = GetResultAtListIndex(
+		ListView_GetNextItem(GetResultsListView(), -1, LVNI_FOCUSED | LVNI_SELECTED));
+	size_t locationResult = focusedResult ? *focusedResult : items[0];
+
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_SEARCH_OPEN_FILE_LOCATION))
+			.SetSelectedCallback([this, locationResult] { OpenResultLocation(locationResult); }));
+
+	popupMenu.AppendSeparator();
+
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_EDIT_CUT))
+			.SetSelectedCallback([this, items] { CopyResultsToClipboard(items, true); }));
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_EDIT_COPY))
+			.SetSelectedCallback([this, items] { CopyResultsToClipboard(items, false); }));
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_FILE_COPYITEMPATH))
+			.SetSelectedCallback([this, items] { CopyResultPathsToClipboard(items); }));
+
+	popupMenu.AppendSeparator();
+
+	popupMenu.AppendItem(
+		MenuItemParams(m_resourceLoader->LoadString(IDS_FILE_DELETE))
+			.SetSelectedCallback([this, items] { DeleteResults(items, IsKeyDown(VK_SHIFT)); }));
+
+	popupMenu.Show(ptScreen);
+}
+
+LRESULT SearchDialog::ResultsListViewSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg)
+	{
+	case WM_GETDLGCODE:
+		// Enter should open the selected items, rather than activating the default button in the
+		// dialog.
+		if (lParam && reinterpret_cast<MSG *>(lParam)->message == WM_KEYDOWN && wParam == VK_RETURN)
+		{
+			return DLGC_WANTALLKEYS;
+		}
+		break;
+
+	case WM_KEYDOWN:
+	{
+		bool ctrlDown = IsKeyDown(VK_CONTROL);
+		bool shiftDown = IsKeyDown(VK_SHIFT);
+
+		switch (wParam)
+		{
+		case VK_RETURN:
+			OpenResults(GetSelectedResults());
+			return 0;
+
+		case VK_DELETE:
+			DeleteResults(GetSelectedResults(), shiftDown);
+			return 0;
+
+		case 'A':
+			if (ctrlDown)
+			{
+				SelectAllResults();
+				return 0;
+			}
+			break;
+
+		case 'C':
+			if (ctrlDown && shiftDown)
+			{
+				CopyResultPathsToClipboard(GetSelectedResults());
+				return 0;
+			}
+			else if (ctrlDown)
+			{
+				CopyResultsToClipboard(GetSelectedResults(), false);
+				return 0;
+			}
+			break;
+
+		case 'X':
+			if (ctrlDown)
+			{
+				CopyResultsToClipboard(GetSelectedResults(), true);
+				return 0;
+			}
+			break;
+		}
+	}
+	break;
+
+	case WM_CHAR:
+		// Prevents the beep that would otherwise be played when Enter is pressed.
+		if (wParam == VK_RETURN)
+		{
+			return 0;
+		}
+		break;
+
+	case WM_CONTEXTMENU:
+	{
+		POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+		// The menu was invoked via the keyboard, so it's shown next to the focused item.
+		if (ptScreen.x == -1 && ptScreen.y == -1)
+		{
+			int focusedIndex = ListView_GetNextItem(hwnd, -1, LVNI_FOCUSED | LVNI_SELECTED);
+			RECT itemRect = {};
+
+			if (focusedIndex != -1
+				&& ListView_GetItemRect(hwnd, focusedIndex, &itemRect, LVIR_LABEL))
+			{
+				ptScreen = { itemRect.left, itemRect.bottom };
+			}
+
+			ClientToScreen(hwnd, &ptScreen);
+		}
+
+		ShowContextMenu(ptScreen);
+		return 0;
+	}
+	}
+
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 INT_PTR SearchDialog::OnNotify(NMHDR *pnmhdr)
 {
-	switch (pnmhdr->code)
+	if (pnmhdr->hwndFrom == GetResultsListView())
 	{
-	case NM_DBLCLK:
-		if (pnmhdr->hwndFrom == GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS))
+		switch (pnmhdr->code)
 		{
-			HWND hListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
-			int iSelected = ListView_GetNextItem(hListView, -1, LVNI_ALL | LVNI_SELECTED);
+		case LVN_GETDISPINFO:
+			OnGetDisplayInfo(reinterpret_cast<NMLVDISPINFO *>(pnmhdr));
+			break;
 
-			if (iSelected != -1)
+		case LVN_ODFINDITEM:
+			SetWindowLongPtr(m_hDlg, DWLP_MSGRESULT,
+				OnFindItem(reinterpret_cast<NMLVFINDITEM *>(pnmhdr)));
+			return TRUE;
+
+		case NM_DBLCLK:
+		{
+			auto *itemActivate = reinterpret_cast<NMITEMACTIVATE *>(pnmhdr);
+
+			if (auto result = GetResultAtListIndex(itemActivate->iItem))
 			{
-				LVITEM lvItem;
-
-				lvItem.mask = LVIF_PARAM;
-				lvItem.iItem = iSelected;
-				lvItem.iSubItem = 0;
-
-				BOOL bRet = ListView_GetItem(hListView, &lvItem);
-
-				if (bRet)
-				{
-					auto itr = m_SearchItemsMapInternal.find(static_cast<int>(lvItem.lParam));
-					CHECK(itr != m_SearchItemsMapInternal.end());
-
-					auto *browser = m_browserList->GetLastActive();
-					CHECK(browser);
-
-					browser->OpenItem(itr->second.c_str());
-				}
+				OpenResults({ *result });
 			}
 		}
 		break;
 
-	case NM_CLICK:
+		case LVN_COLUMNCLICK:
+			OnColumnClicked(reinterpret_cast<NMLISTVIEW *>(pnmhdr)->iSubItem);
+			break;
+
+		case LVN_BEGINDRAG:
+		case LVN_BEGINRDRAG:
+			StartDraggingResults(GetSelectedResults());
+			break;
+		}
+
+		return 0;
+	}
+
+	switch (pnmhdr->code)
 	{
+	case NM_CLICK:
+	case NM_RETURN:
 		if (pnmhdr->hwndFrom == GetDlgItem(m_hDlg, IDC_LINK_STATUS))
 		{
 			auto pnmlink = reinterpret_cast<PNMLINK>(pnmhdr);
 
 			ShellExecute(nullptr, L"open", pnmlink->item.szUrl, nullptr, nullptr, SW_SHOWNORMAL);
 		}
-	}
-	break;
-
-	case NM_RCLICK:
-	{
-		if (pnmhdr->hwndFrom == GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS))
-		{
-			HWND hListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
-			int iSelected = ListView_GetNextItem(hListView, -1, LVNI_ALL | LVNI_SELECTED);
-
-			if (iSelected != -1)
-			{
-				LVITEM lvItem;
-				lvItem.mask = LVIF_PARAM;
-				lvItem.iItem = iSelected;
-				lvItem.iSubItem = 0;
-				BOOL bRet = ListView_GetItem(hListView, &lvItem);
-
-				if (bRet)
-				{
-					auto itr = m_SearchItemsMapInternal.find(static_cast<int>(lvItem.lParam));
-					CHECK(itr != m_SearchItemsMapInternal.end());
-
-					PidlAbsolute pidlFull;
-					HRESULT hr = SHParseDisplayName(itr->second.c_str(), nullptr,
-						PidlOutParam(pidlFull), 0, nullptr);
-
-					if (hr == S_OK)
-					{
-						auto child = pidlFull.GetLastItem();
-
-						auto parent = pidlFull;
-						auto res = parent.RemoveLastItem();
-						DCHECK(res);
-
-						DWORD dwCursorPos = GetMessagePos();
-
-						POINT ptCursor;
-						ptCursor.x = GET_X_LPARAM(dwCursorPos);
-						ptCursor.y = GET_Y_LPARAM(dwCursorPos);
-
-						ShellItemContextMenu::Flags flags = ShellItemContextMenu::Flags::None;
-
-						if (IsKeyDown(VK_SHIFT))
-						{
-							WI_SetFlag(flags, ShellItemContextMenu::Flags::ExtendedVerbs);
-						}
-
-						PopupMenuView popupMenu(m_hDlg, NoOpMenuHelpTextHost::GetInstance());
-						SearchResultsItemContextMenu menu(&popupMenu, m_acceleratorManager, parent,
-							{ child }, nullptr, flags, m_browserList, m_resourceLoader);
-						popupMenu.Show(ptCursor);
-					}
-				}
-			}
-		}
-	}
-	break;
-
-	case LVN_COLUMNCLICK:
-	{
-		/* A listview header has been clicked,
-		so sort by that column. */
-		auto *pnmlv = reinterpret_cast<NMLISTVIEW *>(pnmhdr);
-
-		/* If the column clicked matches the current sort mode,
-		flip the sort direction, else switch to that sort mode. */
-		if (m_persistentSettings->m_Columns[pnmlv->iSubItem].sortMode
-			== m_persistentSettings->m_SortMode)
-		{
-			m_persistentSettings->m_bSortAscending = !m_persistentSettings->m_bSortAscending;
-		}
-		else
-		{
-			m_persistentSettings->m_SortMode =
-				m_persistentSettings->m_Columns[pnmlv->iSubItem].sortMode;
-			m_persistentSettings->m_bSortAscending =
-				m_persistentSettings->m_Columns[pnmlv->iSubItem].bSortAscending;
-		}
-
-		ListView_SortItems(GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS),
-			NSearchDialog::SortResultsStub, reinterpret_cast<LPARAM>(this));
-
-		UpdateListViewHeader();
-	}
-	break;
+		break;
 	}
 
 	return 0;
 }
 
-INT_PTR SearchDialog::OnPrivateMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
-{
-	switch (uMsg)
-	{
-	/* We won't actually process the item here. Instead, we'll
-	add it onto the list of current items, which will be processed
-	in batch. This is done to stop this message from blocking the
-	main GUI (also see http://www.flounder.com/iocompletion.htm). */
-	case NSearchDialog::WM_APP_SEARCHITEMFOUND:
-	{
-		m_AwaitingSearchItems.push_back(reinterpret_cast<PIDLIST_ABSOLUTE>(wParam));
-
-		if (m_bSetSearchTimer)
-		{
-			SetTimer(m_hDlg, SEARCH_PROCESSITEMS_TIMER_ID, SEARCH_PROCESSITEMS_TIMER_ELAPSED,
-				nullptr);
-
-			m_bSetSearchTimer = FALSE;
-		}
-	}
-	break;
-
-	case NSearchDialog::WM_APP_SEARCHFINISHED:
-	{
-		TCHAR szStatus[512];
-
-		if (!m_bStopSearching)
-		{
-			int iFoldersFound = LOWORD(lParam);
-			int iFilesFound = HIWORD(lParam);
-
-			auto messageTemplate = m_resourceLoader->LoadString(IDS_SEARCH_FINISHED_MESSAGE);
-			StringCchPrintf(szStatus, std::size(szStatus), messageTemplate.c_str(), iFoldersFound,
-				iFilesFound);
-			SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, szStatus);
-		}
-		else
-		{
-			auto cancelledMessage = m_resourceLoader->LoadString(IDS_SEARCH_CANCELLED_MESSAGE);
-			SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, cancelledMessage.c_str());
-		}
-
-		assert(m_pSearch != nullptr);
-
-		m_pSearch->Release();
-		m_pSearch = nullptr;
-
-		m_bSearching = FALSE;
-		m_bStopSearching = FALSE;
-		SetDlgItemText(m_hDlg, IDSEARCH, m_szSearchButton);
-	}
-	break;
-
-	case NSearchDialog::WM_APP_SEARCHCHANGEDDIRECTORY:
-	{
-		TCHAR szStatus[512];
-		TCHAR *pszDirectory = nullptr;
-
-		pszDirectory = reinterpret_cast<TCHAR *>(wParam);
-
-		auto messageTemplate = m_resourceLoader->LoadString(IDS_SEARCHING);
-		StringCchPrintf(szStatus, std::size(szStatus), messageTemplate.c_str(), pszDirectory);
-		SetDlgItemText(m_hDlg, IDC_STATIC_STATUS, szStatus);
-	}
-	break;
-
-	case NSearchDialog::WM_APP_REGULAREXPRESSIONINVALID:
-	{
-		/* The link/status controls are in the same position, and
-		have the same size. If one of the controls is showing text,
-		the other should not be visible. */
-		ShowWindow(GetDlgItem(m_hDlg, IDC_LINK_STATUS), SW_SHOW);
-		ShowWindow(GetDlgItem(m_hDlg, IDC_STATIC_STATUS), SW_HIDE);
-
-		/* The regular expression passed to the search
-		thread was invalid. Show the user an error message. */
-		auto errorMessage = m_resourceLoader->LoadString(IDS_SEARCH_REGULAR_EXPRESSION_INVALID);
-		SetDlgItemText(m_hDlg, IDC_LINK_STATUS, errorMessage.c_str());
-
-		assert(m_pSearch != nullptr);
-
-		m_pSearch->Release();
-		m_pSearch = nullptr;
-
-		m_bSearching = FALSE;
-		m_bStopSearching = FALSE;
-		SetDlgItemText(m_hDlg, IDSEARCH, m_szSearchButton);
-	}
-	break;
-	}
-
-	return 0;
-}
-
-INT_PTR SearchDialog::OnTimer(int iTimerID)
-{
-	if (iTimerID != SEARCH_PROCESSITEMS_TIMER_ID)
-	{
-		return 1;
-	}
-
-	HWND hListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
-	int nListViewItems = ListView_GetItemCount(hListView);
-
-	int nItems =
-		std::min(static_cast<int>(m_AwaitingSearchItems.size()), SEARCH_MAX_ITEMS_BATCH_PROCESS);
-	int i = 0;
-
-	auto itr = m_AwaitingSearchItems.begin();
-
-	while (i < nItems)
-	{
-		LVITEM lvItem;
-		SHFILEINFO shfi;
-		int iIndex;
-
-		PIDLIST_ABSOLUTE pidl = *itr;
-
-		std::wstring fullFileName;
-		GetDisplayName(pidl, SHGDN_FORPARSING, fullFileName);
-
-		TCHAR directory[MAX_PATH];
-		StringCchCopy(directory, std::size(directory), fullFileName.c_str());
-		PathRemoveFileSpec(directory);
-
-		std::wstring fileName;
-		GetDisplayName(pidl, SHGDN_INFOLDER | SHGDN_FORPARSING, fileName);
-
-		SHGetFileInfo((LPCWSTR) pidl, 0, &shfi, sizeof(shfi), SHGFI_PIDL | SHGFI_SYSICONINDEX);
-
-		m_SearchItemsMapInternal.insert(
-			std::unordered_map<int, std::wstring>::value_type(m_iInternalIndex, fullFileName));
-
-		lvItem.mask = LVIF_IMAGE | LVIF_TEXT | LVIF_PARAM;
-		lvItem.pszText = fileName.data();
-		lvItem.iItem = nListViewItems + i;
-		lvItem.iSubItem = 0;
-		lvItem.iImage = shfi.iIcon;
-		lvItem.lParam = m_iInternalIndex++;
-		iIndex = ListView_InsertItem(hListView, &lvItem);
-
-		ListView_SetItemText(hListView, iIndex, 1, directory);
-
-		CoTaskMemFree(pidl);
-
-		itr = m_AwaitingSearchItems.erase(itr);
-
-		i++;
-	}
-
-	m_bSetSearchTimer = TRUE;
-
-	return 0;
-}
-
-INT_PTR SearchDialog::OnClose()
-{
-	DestroyWindow(m_hDlg);
-
-	return 0;
-}
-
-DWORD WINAPI NSearchDialog::SearchThread(LPVOID pParam)
-{
-	assert(pParam != nullptr);
-
-	auto *pSearch = reinterpret_cast<Search *>(pParam);
-	pSearch->StartSearching();
-
-	return 0;
-}
-
-Search::Search(HWND hDlg, TCHAR *szBaseDirectory, TCHAR *szPattern, DWORD dwAttributes,
-	BOOL bUseRegularExpressions, BOOL bCaseInsensitive, BOOL bSearchSubFolders)
-{
-	m_hDlg = hDlg;
-	m_dwAttributes = dwAttributes;
-	m_bUseRegularExpressions = bUseRegularExpressions;
-	m_bCaseInsensitive = bCaseInsensitive;
-	m_bSearchSubFolders = bSearchSubFolders;
-
-	StringCchCopy(m_szBaseDirectory, std::size(m_szBaseDirectory), szBaseDirectory);
-	StringCchCopy(m_szSearchPattern, std::size(m_szSearchPattern), szPattern);
-
-	InitializeCriticalSection(&m_csStop);
-	m_bStopSearching = FALSE;
-}
-
-Search::~Search()
-{
-	DeleteCriticalSection(&m_csStop);
-}
-
-void Search::StartSearching()
-{
-	m_iFoldersFound = 0;
-	m_iFilesFound = 0;
-
-	if (lstrlen(m_szSearchPattern) != 0 && m_bUseRegularExpressions)
-	{
-		try
-		{
-			if (m_bCaseInsensitive)
-			{
-				m_rxPattern.assign(m_szSearchPattern, std::regex_constants::icase);
-			}
-			else
-			{
-				m_rxPattern.assign(m_szSearchPattern);
-			}
-		}
-		catch (std::exception)
-		{
-			SendMessage(m_hDlg, NSearchDialog::WM_APP_REGULAREXPRESSIONINVALID, 0, 0);
-
-			return;
-		}
-	}
-
-	SearchDirectory(m_szBaseDirectory);
-
-	SendMessage(m_hDlg, NSearchDialog::WM_APP_SEARCHFINISHED, 0,
-		MAKELPARAM(m_iFoldersFound, m_iFilesFound));
-
-	Release();
-}
-
-void Search::SearchDirectory(const TCHAR *szDirectory)
-{
-	SendMessage(m_hDlg, NSearchDialog::WM_APP_SEARCHCHANGEDDIRECTORY,
-		reinterpret_cast<WPARAM>(szDirectory), 0);
-
-	std::list<std::wstring> subFolderList;
-
-	SearchDirectoryInternal(szDirectory, &subFolderList);
-
-	bool bStop = false;
-
-	EnterCriticalSection(&m_csStop);
-	if (m_bStopSearching)
-	{
-		bStop = true;
-	}
-	LeaveCriticalSection(&m_csStop);
-
-	if (bStop)
-	{
-		return;
-	}
-
-	if (m_bSearchSubFolders)
-	{
-		for (const auto &strSubFolder : subFolderList)
-		{
-			SearchDirectory(strSubFolder.c_str());
-		}
-	}
-}
-
-/* Can't recurse, as it would overflow the stack. */
-void Search::SearchDirectoryInternal(const TCHAR *szSearchDirectory,
-	std::list<std::wstring> *pSubFolderList)
-{
-	assert(szSearchDirectory != nullptr);
-	assert(pSubFolderList != nullptr);
-
-	WIN32_FIND_DATA wfd;
-	TCHAR szSearchTerm[MAX_PATH];
-
-	PathCombine(szSearchTerm, szSearchDirectory, _T("*"));
-
-	HANDLE hFindFile = FindFirstFile(szSearchTerm, &wfd);
-
-	if (hFindFile != INVALID_HANDLE_VALUE)
-	{
-		bool bStop = false;
-
-		while (FindNextFile(hFindFile, &wfd) != 0 && !bStop)
-		{
-			if (lstrcmpi(wfd.cFileName, _T(".")) != 0 && lstrcmpi(wfd.cFileName, _T("..")) != 0)
-			{
-				BOOL bMatchFileName = FALSE;
-				BOOL bMatchAttributes = FALSE;
-
-				/* Only match against the filename if it's not empty. */
-				if (lstrlen(m_szSearchPattern) != 0)
-				{
-					if (m_bUseRegularExpressions)
-					{
-						if (std::regex_match(wfd.cFileName, m_rxPattern))
-						{
-							bMatchFileName = TRUE;
-						}
-					}
-					else
-					{
-						if (CheckWildcardMatch(m_szSearchPattern, wfd.cFileName,
-								!m_bCaseInsensitive))
-						{
-							bMatchFileName = TRUE;
-						}
-					}
-				}
-				else
-				{
-					/* No filename constraint, so all filenames match. */
-					bMatchFileName = TRUE;
-				}
-
-				if (m_dwAttributes != 0)
-				{
-					if ((wfd.dwFileAttributes & m_dwAttributes) == m_dwAttributes)
-					{
-						bMatchAttributes = TRUE;
-					}
-				}
-				else
-				{
-					bMatchAttributes = TRUE;
-				}
-
-				BOOL bItemMatch = bMatchFileName && bMatchAttributes;
-
-				if (bItemMatch)
-				{
-					if ((wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-						== FILE_ATTRIBUTE_DIRECTORY)
-					{
-						m_iFoldersFound++;
-					}
-					else
-					{
-						m_iFilesFound++;
-					}
-
-					TCHAR szFullFileName[MAX_PATH];
-					PathCombine(szFullFileName, szSearchDirectory, wfd.cFileName);
-
-					unique_pidl_absolute pidl;
-					SHParseDisplayName(szFullFileName, nullptr, wil::out_param(pidl), 0, nullptr);
-
-					PostMessage(m_hDlg, NSearchDialog::WM_APP_SEARCHITEMFOUND,
-						reinterpret_cast<WPARAM>(ILCloneFull(pidl.get())), 0);
-				}
-
-				if ((wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == FILE_ATTRIBUTE_DIRECTORY)
-				{
-					TCHAR szSubFolder[MAX_PATH];
-
-					PathCombine(szSubFolder, szSearchDirectory, wfd.cFileName);
-
-					pSubFolderList->push_back(szSubFolder);
-				}
-			}
-
-			EnterCriticalSection(&m_csStop);
-			if (m_bStopSearching)
-			{
-				bStop = true;
-			}
-			LeaveCriticalSection(&m_csStop);
-		}
-
-		FindClose(hFindFile);
-	}
-}
-
-void Search::StopSearching()
-{
-	EnterCriticalSection(&m_csStop);
-	m_bStopSearching = TRUE;
-	LeaveCriticalSection(&m_csStop);
-}
+const TCHAR SearchDialogPersistentSettings::SETTINGS_KEY[] = _T("Search");
+
+const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_1[] = _T("ColumnWidth1");
+const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_2[] = _T("ColumnWidth2");
+const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_3[] = _T("ColumnWidth3");
+const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_4[] = _T("ColumnWidth4");
+const TCHAR SearchDialogPersistentSettings::SETTING_COLUMN_WIDTH_5[] = _T("ColumnWidth5");
+const TCHAR SearchDialogPersistentSettings::SETTING_ITEM_TYPE[] = _T("ItemType");
+const TCHAR SearchDialogPersistentSettings::SETTING_SEARCH_DIRECTORY_TEXT[] =
+	_T("SearchDirectoryText");
+const TCHAR SearchDialogPersistentSettings::SETTING_SEARCH_SUB_FOLDERS[] = _T("SearchSubFolders");
+const TCHAR SearchDialogPersistentSettings::SETTING_USE_REGULAR_EXPRESSIONS[] =
+	_T("UseRegularExpressions");
+const TCHAR SearchDialogPersistentSettings::SETTING_CASE_INSENSITIVE[] = _T("CaseInsensitive");
+const TCHAR SearchDialogPersistentSettings::SETTING_ARCHIVE[] = _T("Archive");
+const TCHAR SearchDialogPersistentSettings::SETTING_HIDDEN[] = _T("Hidden");
+const TCHAR SearchDialogPersistentSettings::SETTING_READ_ONLY[] = _T("ReadOnly");
+const TCHAR SearchDialogPersistentSettings::SETTING_SYSTEM[] = _T("System");
+const TCHAR SearchDialogPersistentSettings::SETTING_SORT_MODE[] = _T("SortMode");
+const TCHAR SearchDialogPersistentSettings::SETTING_SORT_ASCENDING[] = _T("SortAscending");
+const TCHAR SearchDialogPersistentSettings::SETTING_DIRECTORY_LIST[] = _T("Directory");
+const TCHAR SearchDialogPersistentSettings::SETTING_PATTERN_LIST[] = _T("Pattern");
 
 void SearchDialog::SaveState()
 {
-	HWND hListView;
-
 	m_persistentSettings->SaveDialogPosition(m_hDlg);
 
 	m_persistentSettings->m_bCaseInsensitive =
@@ -1069,10 +2045,22 @@ void SearchDialog::SaveState()
 
 	m_persistentSettings->m_bSystem = IsDlgButtonChecked(m_hDlg, IDC_CHECK_SYSTEM) == BST_CHECKED;
 
-	hListView = GetDlgItem(m_hDlg, IDC_LISTVIEW_SEARCHRESULTS);
+	if (HWND itemTypeCombo = GetDlgItem(m_hDlg, IDC_SEARCH_ITEM_TYPE))
+	{
+		auto selection = ComboBox_GetCurSel(itemTypeCombo);
 
-	m_persistentSettings->m_iColumnWidth1 = ListView_GetColumnWidth(hListView, 0);
-	m_persistentSettings->m_iColumnWidth2 = ListView_GetColumnWidth(hListView, 1);
+		if (selection != CB_ERR)
+		{
+			m_persistentSettings->m_itemType = selection;
+		}
+	}
+
+	HWND listView = GetResultsListView();
+
+	for (int i = 0; i < SearchDialogPersistentSettings::NUM_COLUMNS; i++)
+	{
+		m_persistentSettings->m_columnWidths[i] = ListView_GetColumnWidth(listView, i);
+	}
 
 	m_persistentSettings->m_searchPattern = GetDlgItemString(m_hDlg, IDC_COMBO_NAME);
 
@@ -1091,8 +2079,8 @@ SearchDialogPersistentSettings::SearchDialogPersistentSettings() :
 	m_bHidden = FALSE;
 	m_bReadOnly = FALSE;
 	m_bSystem = FALSE;
-	m_iColumnWidth1 = -1;
-	m_iColumnWidth2 = -1;
+	m_itemType = static_cast<int>(SearchItemType::FilesAndFolders);
+	m_columnWidths.fill(-1);
 
 	ColumnInfo ci;
 	ci.sortMode = SortMode::Name;
@@ -1102,6 +2090,21 @@ SearchDialogPersistentSettings::SearchDialogPersistentSettings() :
 
 	ci.sortMode = SortMode::Path;
 	ci.uStringID = IDS_SEARCH_COLUMN_PATH;
+	ci.bSortAscending = true;
+	m_Columns.push_back(ci);
+
+	ci.sortMode = SortMode::Size;
+	ci.uStringID = IDS_COLUMN_NAME_SIZE;
+	ci.bSortAscending = false;
+	m_Columns.push_back(ci);
+
+	ci.sortMode = SortMode::DateModified;
+	ci.uStringID = IDS_COLUMN_NAME_DATEMODIFIED;
+	ci.bSortAscending = false;
+	m_Columns.push_back(ci);
+
+	ci.sortMode = SortMode::Type;
+	ci.uStringID = IDS_COLUMN_NAME_TYPE;
 	ci.bSortAscending = true;
 	m_Columns.push_back(ci);
 
@@ -1117,8 +2120,12 @@ SearchDialogPersistentSettings &SearchDialogPersistentSettings::GetInstance()
 
 void SearchDialogPersistentSettings::SaveExtraRegistrySettings(HKEY hKey)
 {
-	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_1, m_iColumnWidth1);
-	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_2, m_iColumnWidth2);
+	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_1, m_columnWidths[0]);
+	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_2, m_columnWidths[1]);
+	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_3, m_columnWidths[2]);
+	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_4, m_columnWidths[3]);
+	RegistrySettings::SaveDword(hKey, SETTING_COLUMN_WIDTH_5, m_columnWidths[4]);
+	RegistrySettings::SaveDword(hKey, SETTING_ITEM_TYPE, m_itemType);
 	RegistrySettings::SaveString(hKey, SETTING_SEARCH_DIRECTORY_TEXT, m_searchPattern);
 	RegistrySettings::SaveDword(hKey, SETTING_SEARCH_SUB_FOLDERS, m_bSearchSubFolders);
 	RegistrySettings::SaveDword(hKey, SETTING_USE_REGULAR_EXPRESSIONS, m_bUseRegularExpressions);
@@ -1141,8 +2148,12 @@ void SearchDialogPersistentSettings::SaveExtraRegistrySettings(HKEY hKey)
 
 void SearchDialogPersistentSettings::LoadExtraRegistrySettings(HKEY hKey)
 {
-	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_1, m_iColumnWidth1);
-	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_2, m_iColumnWidth2);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_1, m_columnWidths[0]);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_2, m_columnWidths[1]);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_3, m_columnWidths[2]);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_4, m_columnWidths[3]);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_COLUMN_WIDTH_5, m_columnWidths[4]);
+	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_ITEM_TYPE, m_itemType);
 	RegistrySettings::ReadString(hKey, SETTING_SEARCH_DIRECTORY_TEXT, m_searchPattern);
 	RegistrySettings::Read32BitValueFromRegistry(hKey, SETTING_SEARCH_SUB_FOLDERS,
 		m_bSearchSubFolders);
@@ -1173,9 +2184,17 @@ void SearchDialogPersistentSettings::SaveExtraXMLSettings(IXMLDOMDocument *pXMLD
 	IXMLDOMElement *pParentNode)
 {
 	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_COLUMN_WIDTH_1,
-		XMLSettings::EncodeIntValue(m_iColumnWidth1));
+		XMLSettings::EncodeIntValue(m_columnWidths[0]));
 	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_COLUMN_WIDTH_2,
-		XMLSettings::EncodeIntValue(m_iColumnWidth2));
+		XMLSettings::EncodeIntValue(m_columnWidths[1]));
+	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_COLUMN_WIDTH_3,
+		XMLSettings::EncodeIntValue(m_columnWidths[2]));
+	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_COLUMN_WIDTH_4,
+		XMLSettings::EncodeIntValue(m_columnWidths[3]));
+	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_COLUMN_WIDTH_5,
+		XMLSettings::EncodeIntValue(m_columnWidths[4]));
+	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_ITEM_TYPE,
+		XMLSettings::EncodeIntValue(m_itemType));
 	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_SEARCH_DIRECTORY_TEXT,
 		m_searchPattern.c_str());
 	XMLSettings::AddAttributeToNode(pXMLDom, pParentNode, SETTING_SEARCH_SUB_FOLDERS,
@@ -1211,11 +2230,27 @@ void SearchDialogPersistentSettings::LoadExtraXMLSettings(BSTR bstrName, BSTR bs
 {
 	if (lstrcmpi(bstrName, SETTING_COLUMN_WIDTH_1) == 0)
 	{
-		m_iColumnWidth1 = XMLSettings::DecodeIntValue(bstrValue);
+		m_columnWidths[0] = XMLSettings::DecodeIntValue(bstrValue);
 	}
 	else if (lstrcmpi(bstrName, SETTING_COLUMN_WIDTH_2) == 0)
 	{
-		m_iColumnWidth2 = XMLSettings::DecodeIntValue(bstrValue);
+		m_columnWidths[1] = XMLSettings::DecodeIntValue(bstrValue);
+	}
+	else if (lstrcmpi(bstrName, SETTING_COLUMN_WIDTH_3) == 0)
+	{
+		m_columnWidths[2] = XMLSettings::DecodeIntValue(bstrValue);
+	}
+	else if (lstrcmpi(bstrName, SETTING_COLUMN_WIDTH_4) == 0)
+	{
+		m_columnWidths[3] = XMLSettings::DecodeIntValue(bstrValue);
+	}
+	else if (lstrcmpi(bstrName, SETTING_COLUMN_WIDTH_5) == 0)
+	{
+		m_columnWidths[4] = XMLSettings::DecodeIntValue(bstrValue);
+	}
+	else if (lstrcmpi(bstrName, SETTING_ITEM_TYPE) == 0)
+	{
+		m_itemType = XMLSettings::DecodeIntValue(bstrValue);
 	}
 	else if (lstrcmpi(bstrName, SETTING_SEARCH_DIRECTORY_TEXT) == 0)
 	{
