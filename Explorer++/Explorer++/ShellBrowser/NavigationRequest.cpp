@@ -10,6 +10,9 @@
 #include "ShellBrowser.h"
 #include "ShellEnumerator.h"
 #include "../Helper/ShellHelper.h"
+#include "../Helper/StringHelper.h"
+#include <glog/logging.h>
+#include <chrono>
 
 NavigationRequest::NavigationRequest(const ShellBrowser *shellBrowser,
 	NavigationEvents *navigationEvents, NavigationRequestDelegate *delegate,
@@ -121,6 +124,8 @@ concurrencpp::null_result NavigationRequest::StartInternal(WeakPtr<NavigationReq
 	// matches the behavior of Explorer. For example, if a symlink to a directory is created and the
 	// target directory is then removed, Explorer will try to navigate to the target, without
 	// attempting to resolve the link.
+	auto enumerationStart = std::chrono::steady_clock::now();
+
 	PidlAbsolute targetPidl;
 	HRESULT hr = MaybeGetLinkTarget(navigateParams.pidl.Raw(), targetPidl);
 
@@ -135,6 +140,18 @@ concurrencpp::null_result NavigationRequest::StartInternal(WeakPtr<NavigationReq
 		showHidden ? ShellItemFilter::HiddenItemPolicy::Include
 				   : ShellItemFilter::HiddenItemPolicy::Exclude,
 		items, stopToken);
+
+	// Logged to help diagnose slow folders (only written when logging is enabled).
+	if (FLAGS_minloglevel <= google::GLOG_INFO)
+	{
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - enumerationStart);
+		std::wstring path;
+		GetDisplayName(navigateParams.pidl.Raw(), SHGDN_FORPARSING, path);
+		LOG(INFO) << "Navigation: enumerating " << wstrToUtf8Str(path) << " took "
+				  << elapsed.count() << " ms (" << items.size() << " items, hr = 0x" << std::hex
+				  << static_cast<unsigned long>(hr) << ")";
+	}
 
 	co_await concurrencpp::resume_on(originalExecutor);
 
