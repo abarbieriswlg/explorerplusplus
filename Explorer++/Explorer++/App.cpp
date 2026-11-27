@@ -77,7 +77,7 @@ App::App(const CommandLine::Settings *commandLineSettings) :
 	INITCOMMONCONTROLSEX commonControls = {};
 	commonControls.dwSize = sizeof(commonControls);
 	commonControls.dwICC = ICC_BAR_CLASSES | ICC_COOL_CLASSES | ICC_LISTVIEW_CLASSES
-		| ICC_USEREX_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS;
+		| ICC_USEREX_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS | ICC_DATE_CLASSES;
 	BOOL res = InitCommonControlsEx(&commonControls);
 	CHECK(res);
 

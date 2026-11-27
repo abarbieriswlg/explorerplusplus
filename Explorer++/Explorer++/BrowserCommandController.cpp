@@ -734,7 +734,8 @@ void BrowserCommandController::OnSearch()
 		{
 			return SearchDialog::Create(m_appServices->GetResourceLoader(),
 				m_browser->GetView()->GetHWND(), GetActiveShellBrowser()->GetDirectoryPath(),
-				m_appServices->GetBrowserList(), m_appServices->GetAcceleratorManager());
+				m_appServices->GetBrowserList(), m_appServices->GetAcceleratorManager(),
+				m_appServices->GetPlatformContext()->GetClipboardStore());
 		});
 }
 
