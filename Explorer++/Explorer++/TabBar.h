@@ -8,6 +8,7 @@
 #include "OneShotTimer.h"
 #include "OneShotTimerManager.h"
 #include "ShellBrowser/FolderSettings.h"
+#include "ShellBrowser/NavigateParams.h"
 #include "Tab.h"
 #include "TabView.h"
 #include "TabViewDelegate.h"
@@ -32,6 +33,11 @@ struct TabSettings
 	std::optional<Tab::LockState> lockState;
 	std::optional<int> index;
 	std::optional<bool> selected;
+
+	// If true, the tab won't be navigated until it's first selected. This is used when restoring
+	// tabs on startup, so that tabs in the background don't need to be loaded straight away (which
+	// can be slow, particularly for network locations, or folders containing many items).
+	bool deferNavigation = false;
 
 	// This is only used in tests.
 	bool operator==(const TabSettings &) const = default;
@@ -90,6 +96,10 @@ public:
 	std::vector<Tab *> GetAllTabsInOrder() const;
 
 	std::vector<TabStorageData> GetStorageData() const;
+
+	// If the tab was created with a deferred navigation that hasn't started yet, this will start
+	// it.
+	void MaybeStartDeferredNavigation(const Tab &tab);
 
 private:
 	// Contains data used when an item is dragged over this window.
@@ -153,6 +163,10 @@ private:
 
 	std::vector<int> m_tabSelectionHistory;
 	int m_iPreviousTabSelectionId;
+
+	// Navigations for tabs that haven't been selected yet (see TabSettings::deferNavigation),
+	// keyed by tab ID.
+	std::unordered_map<int, NavigateParams> m_deferredNavigations;
 
 	// Drop handling
 	std::optional<DropTargetContext> m_dropTargetContext;

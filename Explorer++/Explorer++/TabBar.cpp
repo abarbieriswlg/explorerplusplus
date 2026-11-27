@@ -224,6 +224,10 @@ void TabBar::OnTabSelected(const Tab &tab)
 
 	m_iPreviousTabSelectionId = tab.GetId();
 
+	// This is done before observers are notified, so that the tab is already loading by the time
+	// they're invoked.
+	MaybeStartDeferredNavigation(tab);
+
 	m_tabEvents->NotifySelected(tab);
 }
 
@@ -392,9 +396,64 @@ Tab &TabBar::SetUpNewTab(Tab &tab, NavigateParams &navigateParams, const TabSett
 		OnTabSelected(tab);
 	}
 
-	tab.GetShellBrowser()->GetNavigationController()->Navigate(navigateParams);
+	// Note that the deferred navigation is recorded even if the tab is currently selected. That's
+	// because, when creating a set of tabs, the first tab is implicitly selected, even though a
+	// different tab may be selected once all the tabs have been created. The caller is responsible
+	// for calling MaybeStartDeferredNavigation() for the tab that's ultimately selected.
+	if (tabSettings.deferNavigation)
+	{
+		m_deferredNavigations.insert_or_assign(tab.GetId(), navigateParams);
+	}
+	else
+	{
+		tab.GetShellBrowser()->GetNavigationController()->Navigate(navigateParams);
+	}
 
 	return tab;
+}
+
+void TabBar::MaybeStartDeferredNavigation(const Tab &tab)
+{
+	auto itr = m_deferredNavigations.find(tab.GetId());
+
+	if (itr == m_deferredNavigations.end())
+	{
+		return;
+	}
+
+	auto navigateParams = std::move(itr->second);
+	m_deferredNavigations.erase(itr);
+
+	auto *navigationController = tab.GetShellBrowser()->GetNavigationController();
+
+	// If the tab has been navigated in the meantime (e.g. via a plugin), the deferred navigation
+	// is no longer relevant.
+	if (!navigationController->GetCurrentEntry()->IsInitialEntry()
+		|| tab.GetShellBrowser()->MaybeGetLatestActiveNavigation())
+	{
+		return;
+	}
+
+	// Network paths for deferred tabs are only parsed into a "simple" pidl when the tab is created
+	// (see Explorerplusplus::CreateTabsFromStorageData()), since fully parsing them requires
+	// contacting the server, which can block for a significant amount of time if the server isn't
+	// available. The path is fully parsed now, when the tab is actually being shown.
+	std::wstring parsingPath;
+	HRESULT hr = GetDisplayName(navigateParams.pidl.Raw(), SHGDN_FORPARSING, parsingPath);
+
+	if (SUCCEEDED(hr) && PathIsUNC(parsingPath.c_str()))
+	{
+		PidlAbsolute parsedPidl;
+		hr = SHParseDisplayName(parsingPath.c_str(), nullptr, PidlOutParam(parsedPidl), 0, nullptr);
+
+		if (SUCCEEDED(hr))
+		{
+			navigateParams.requestPidl = parsedPidl;
+			navigateParams.pidl = parsedPidl;
+		}
+	}
+
+	navigationController->Navigate(navigateParams);
 }
 
 void TabBar::CloseAllTabs()
@@ -436,6 +495,7 @@ bool TabBar::CloseTab(const Tab &tab, CloseMode closeMode)
 	auto ownedTab = std::move(*itr);
 
 	m_tabs.erase(itr);
+	m_deferredNavigations.erase(tab.GetId());
 
 	m_tabEvents->NotifyRemoved(tab);
 
