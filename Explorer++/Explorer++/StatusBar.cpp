@@ -16,9 +16,10 @@
 #include "TabEvents.h"
 #include <fmt/xchar.h>
 #include <wil/common.h>
+#include <chrono>
 #include <format>
 
-StatusBar::StatusBar(StatusBarView *view, const BrowserWindow *browser, const Config *config,
+StatusBar::StatusBar(StatusBarView *view, BrowserWindow *browser, const Config *config,
 	TabEvents *tabEvents, ShellBrowserEvents *shellBrowserEvents,
 	NavigationEvents *navigationEvents, const ResourceLoader *resourceLoader) :
 	m_view(view),
@@ -26,7 +27,13 @@ StatusBar::StatusBar(StatusBarView *view, const BrowserWindow *browser, const Co
 	m_config(config),
 	m_resourceLoader(resourceLoader)
 {
+	m_view->SetFilterBoxCueBanner(m_resourceLoader->LoadString(IDS_QUICK_FILTER_CUE_BANNER));
 	SetStandardParts();
+
+	m_connections.push_back(m_view->filterTextChangedSignal.AddObserver(
+		std::bind_front(&StatusBar::OnFilterTextChanged, this)));
+	m_connections.push_back(m_view->filterBoxExitedSignal.AddObserver(
+		std::bind_front(&StatusBar::OnFilterBoxExited, this)));
 
 	m_connections.push_back(tabEvents->AddSelectedObserver(
 		std::bind_front(&StatusBar::OnTabSelected, this), TabEventScope::ForBrowser(*browser)));
@@ -57,7 +64,30 @@ StatusBar::StatusBar(StatusBarView *view, const BrowserWindow *browser, const Co
 
 void StatusBar::SetStandardParts()
 {
-	m_view->SetParts({ 50, 75, 100 });
+	// The last part contains the quick filter box.
+	m_view->SetParts({ 40, 58, 74, 100 });
+	m_view->SetFilterBoxPart(3);
+}
+
+void StatusBar::FocusFilterBox()
+{
+	m_view->FocusFilterBox();
+}
+
+void StatusBar::OnFilterTextChanged(const std::wstring &text)
+{
+	m_browser->GetActiveShellBrowser()->SetQuickFilter(text);
+}
+
+void StatusBar::OnFilterBoxExited()
+{
+	m_browser->FocusActiveTab();
+}
+
+void StatusBar::UpdateFilterBoxText(const Tab &tab)
+{
+	const auto *shellBrowser = tab.GetShellBrowser();
+	m_view->SetFilterText(shellBrowser->IsFilterEnabled() ? shellBrowser->GetFilterText() : L"");
 }
 
 void StatusBar::OnTabSelected(const Tab &tab)
@@ -98,6 +128,7 @@ void StatusBar::NotifyMenuLoopStarted()
 {
 	m_showingMenuHelpText = true;
 
+	m_view->SetFilterBoxPart(std::nullopt);
 	m_view->SetParts({ 100 });
 	m_view->SetPartText(0, L"");
 }
@@ -126,6 +157,8 @@ void StatusBar::UpdateText(const Tab &tab)
 		// current tab.
 		return;
 	}
+
+	UpdateFilterBoxText(tab);
 
 	if (auto *navigation = tab.GetShellBrowser()->MaybeGetLatestActiveNavigation())
 	{
@@ -201,9 +234,8 @@ void StatusBar::UpdateText(const Tab &tab)
 
 	m_view->SetPartText(1, sizeText);
 
-	std::wstring driveFreeSpaceText =
-		CreateDriveFreeSpaceString(tab.GetShellBrowser()->GetDirectoryPath().c_str());
-	m_view->SetPartText(2, driveFreeSpaceText);
+	m_view->SetPartText(2,
+		GetCachedDriveFreeSpaceString(tab.GetShellBrowser()->GetDirectoryPath()));
 }
 
 void StatusBar::SetLoadingText(PCIDLIST_ABSOLUTE pidl)
@@ -214,6 +246,24 @@ void StatusBar::SetLoadingText(PCIDLIST_ABSOLUTE pidl)
 	m_view->SetPartText(0, loadingText);
 	m_view->SetPartText(1, L"");
 	m_view->SetPartText(2, L"");
+}
+
+// The status bar text is updated whenever the selection changes. Determining the free space
+// requires a call to GetDiskFreeSpaceEx(), which can be slow for network drives and cloud folders.
+// Therefore, the result is cached briefly for each directory.
+std::wstring StatusBar::GetCachedDriveFreeSpaceString(const std::wstring &path)
+{
+	constexpr auto CACHE_DURATION = std::chrono::seconds(5);
+	auto now = std::chrono::steady_clock::now();
+
+	if (path != m_freeSpaceCache.path || (now - m_freeSpaceCache.timestamp) > CACHE_DURATION)
+	{
+		m_freeSpaceCache.path = path;
+		m_freeSpaceCache.text = CreateDriveFreeSpaceString(path);
+		m_freeSpaceCache.timestamp = now;
+	}
+
+	return m_freeSpaceCache.text;
 }
 
 std::wstring StatusBar::CreateDriveFreeSpaceString(const std::wstring &path)

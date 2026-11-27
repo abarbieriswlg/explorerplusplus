@@ -21,6 +21,7 @@
 #include "Plugins/PluginCommandManager.h"
 #include "ResourceLoader.h"
 #include "ShellBrowser/ShellBrowserImpl.h"
+#include "StatusBar.h"
 #include "TabBar.h"
 #include "../Helper/Controls.h"
 #include "../Helper/EnumHelper.h"
@@ -169,6 +170,10 @@ LRESULT Explorerplusplus::HandleMenuOrToolbarButtonOrAccelerator(UINT id, UINT n
 	case IDM_VIEW_SHOWHIDDENFILES:
 	case IDM_VIEW_REFRESH:
 		m_commandController.ExecuteCommand(id);
+		break;
+
+	case IDM_FILTER_FOCUS_QUICK_FILTER:
+		FocusQuickFilter();
 		break;
 
 	case IDM_SORTBY_MORE:
@@ -326,4 +331,15 @@ LRESULT Explorerplusplus::HandleControlNotification(HWND hwnd, UINT notification
 	}
 
 	return 1;
+}
+
+void Explorerplusplus::FocusQuickFilter()
+{
+	if (!m_config->showStatusBar.get())
+	{
+		// The quick filter box is hosted in the status bar, so the status bar needs to be visible.
+		m_config->showStatusBar = true;
+	}
+
+	m_statusBar->FocusFilterBox();
 }

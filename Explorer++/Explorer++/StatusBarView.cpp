@@ -7,7 +7,10 @@
 #include "../Helper/Controls.h"
 #include "../Helper/WindowHelper.h"
 #include "../Helper/WindowSubclass.h"
+#include <wil/common.h>
 #include <wil/resource.h>
+#include <CommCtrl.h>
+#include <windowsx.h>
 
 StatusBarView::StatusBarView(ViewBase *parent, const Config *config) :
 	ViewBase(CreateStatusBar(parent->GetHWND(),
@@ -20,14 +23,231 @@ StatusBarView::StatusBarView(ViewBase *parent, const Config *config) :
 
 	m_fontSetter.fontUpdatedSignal.AddObserver(
 		std::bind_front(&StatusBarView::UpdateMinHeight, this));
+	m_fontSetter.fontUpdatedSignal.AddObserver(
+		std::bind_front(&StatusBarView::UpdateFilterBoxFont, this));
 
 	UpdateControlParts();
+
+	CreateFilterBox();
 
 	// Even if the status bar uses the default font, the height won't necessarily be correct. As
 	// detailed below, if the text size is increased in Windows, the height of the status bar won't
 	// change at 96 DPI. Therefore, setting the minimum height here ensures that the status bar is
 	// sized correctly in that situation.
 	UpdateMinHeight();
+}
+
+StatusBarView::~StatusBarView() = default;
+
+void StatusBarView::CreateFilterBox()
+{
+	// Note that the edit control is created hidden. It will be shown once a part has been
+	// assigned to it.
+	m_filterBox = CreateWindowEx(WS_EX_CLIENTEDGE, WC_EDIT, L"",
+		WS_CHILD | WS_CLIPSIBLINGS | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, GetHWND(), nullptr,
+		GetModuleHandle(nullptr), nullptr);
+	CHECK(m_filterBox);
+
+	m_filterBoxSubclass = std::make_unique<WindowSubclass>(m_filterBox,
+		std::bind_front(&StatusBarView::FilterBoxSubclass, this));
+
+	UpdateFilterBoxFont();
+}
+
+void StatusBarView::UpdateFilterBoxFont()
+{
+	if (!m_filterBox)
+	{
+		return;
+	}
+
+	auto font = reinterpret_cast<HFONT>(SendMessage(GetHWND(), WM_GETFONT, 0, 0));
+	SendMessage(m_filterBox, WM_SETFONT, reinterpret_cast<WPARAM>(font), true);
+
+	UpdateFilterBoxPosition();
+}
+
+void StatusBarView::SetFilterBoxPart(std::optional<int> partIndex)
+{
+	m_filterBoxPart = partIndex;
+
+	if (!m_filterBoxPart)
+	{
+		// If the box is being hidden while it has focus, the focus would otherwise be lost.
+		if (GetFocus() == m_filterBox)
+		{
+			filterBoxExitedSignal.m_signal();
+		}
+
+		ShowWindow(m_filterBox, SW_HIDE);
+		return;
+	}
+
+	UpdateFilterBoxPosition();
+	ShowWindow(m_filterBox, SW_SHOWNA);
+}
+
+void StatusBarView::SetFilterBoxCueBanner(const std::wstring &text)
+{
+	// The cue banner is also shown while the control has focus, so that it's clear what the box
+	// is for, even after it's been focused via the keyboard shortcut.
+	SendMessage(m_filterBox, EM_SETCUEBANNER, true, reinterpret_cast<LPARAM>(text.c_str()));
+}
+
+void StatusBarView::SetFilterText(const std::wstring &text)
+{
+	if (m_filterChangePending)
+	{
+		// The user is in the middle of typing. The text they've entered takes precedence and will
+		// be applied once the debounce timer fires.
+		return;
+	}
+
+	if (text == GetFilterText())
+	{
+		return;
+	}
+
+	m_settingFilterText = true;
+	SetWindowText(m_filterBox, text.c_str());
+	m_settingFilterText = false;
+
+	// Any pending (debounced) change is now out of date.
+	KillTimer(GetHWND(), FILTER_TIMER_ID);
+	m_filterChangePending = false;
+
+	// Place the caret at the end of the text.
+	auto length = GetWindowTextLength(m_filterBox);
+	SendMessage(m_filterBox, EM_SETSEL, length, length);
+}
+
+std::wstring StatusBarView::GetFilterText() const
+{
+	auto length = GetWindowTextLength(m_filterBox);
+	std::wstring text(length + 1, '\0');
+	GetWindowText(m_filterBox, text.data(), length + 1);
+	text.resize(length);
+	return text;
+}
+
+void StatusBarView::FocusFilterBox()
+{
+	if (!m_filterBoxPart)
+	{
+		return;
+	}
+
+	SetFocus(m_filterBox);
+	SendMessage(m_filterBox, EM_SETSEL, 0, -1);
+}
+
+void StatusBarView::UpdateFilterBoxPosition()
+{
+	if (!m_filterBox || !m_filterBoxPart)
+	{
+		return;
+	}
+
+	RECT partRect;
+	auto res =
+		SendMessage(GetHWND(), SB_GETRECT, *m_filterBoxPart, reinterpret_cast<LPARAM>(&partRect));
+
+	if (!res)
+	{
+		return;
+	}
+
+	// The last part extends underneath the size grip, so the box is shrunk to avoid overlapping
+	// it.
+	if (*m_filterBoxPart == static_cast<int>(m_parts.size()) - 1
+		&& WI_IsFlagSet(GetWindowLongPtr(GetHWND(), GWL_STYLE), SBARS_SIZEGRIP))
+	{
+		partRect.right -= GetSystemMetrics(SM_CXVSCROLL);
+	}
+
+	const int padding = 1;
+	InflateRect(&partRect, -padding, -padding);
+
+	SetWindowPos(m_filterBox, nullptr, partRect.left, partRect.top, GetRectWidth(&partRect),
+		GetRectHeight(&partRect), SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void StatusBarView::OnFilterBoxTextChanged()
+{
+	if (m_settingFilterText)
+	{
+		return;
+	}
+
+	// Restarting the timer here means that the filter will only be applied once the user pauses
+	// typing.
+	m_filterChangePending = true;
+	SetTimer(GetHWND(), FILTER_TIMER_ID, FILTER_DEBOUNCE_DELAY_MS, nullptr);
+}
+
+void StatusBarView::FlushPendingFilterChange()
+{
+	KillTimer(GetHWND(), FILTER_TIMER_ID);
+
+	if (!m_filterChangePending)
+	{
+		return;
+	}
+
+	m_filterChangePending = false;
+	filterTextChangedSignal.m_signal(GetFilterText());
+}
+
+LRESULT StatusBarView::FilterBoxSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg)
+	{
+	case WM_GETDLGCODE:
+		switch (wParam)
+		{
+		case VK_ESCAPE:
+		case VK_RETURN:
+			return DLGC_WANTALLKEYS;
+		}
+		break;
+
+	case WM_KEYDOWN:
+		switch (wParam)
+		{
+		case VK_ESCAPE:
+			if (GetWindowTextLength(m_filterBox) > 0)
+			{
+				// The first press of Escape clears the filter (and leaves the focus in the box).
+				// A second press moves the focus back to the listview.
+				SetWindowText(m_filterBox, L"");
+				FlushPendingFilterChange();
+			}
+			else
+			{
+				filterBoxExitedSignal.m_signal();
+			}
+			return 0;
+
+		case VK_RETURN:
+		case VK_DOWN:
+			// Apply the filter immediately and move to the (filtered) list of items.
+			FlushPendingFilterChange();
+			filterBoxExitedSignal.m_signal();
+			return 0;
+		}
+		break;
+
+	case WM_CHAR:
+		// Prevents the default beep that's played when Enter or Escape are pressed in a
+		// single-line edit control.
+		if (wParam == VK_RETURN || wParam == VK_ESCAPE)
+		{
+			return 0;
+		}
+		break;
+	}
+
+	return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 void StatusBarView::UpdateMinHeight()
@@ -95,7 +315,40 @@ LRESULT StatusBarView::StatusBarSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPA
 	switch (msg)
 	{
 	case WM_SIZE:
+	{
 		UpdateControlParts();
+
+		// The default handling resizes the control, so the filter box can only be positioned
+		// correctly once that's done.
+		auto res = DefSubclassProc(hwnd, msg, wParam, lParam);
+		UpdateFilterBoxPosition();
+		return res;
+	}
+
+	case WM_COMMAND:
+		if (reinterpret_cast<HWND>(lParam) == m_filterBox)
+		{
+			switch (HIWORD(wParam))
+			{
+			case EN_CHANGE:
+				OnFilterBoxTextChanged();
+				return 0;
+
+			case EN_KILLFOCUS:
+				// Ensures that a change that's still pending is applied to the tab it was
+				// entered for, before any other tab can be selected.
+				FlushPendingFilterChange();
+				return 0;
+			}
+		}
+		break;
+
+	case WM_TIMER:
+		if (wParam == FILTER_TIMER_ID)
+		{
+			FlushPendingFilterChange();
+			return 0;
+		}
 		break;
 	}
 
@@ -154,4 +407,6 @@ void StatusBarView::UpdateControlParts()
 	auto setPartsRes = SendMessage(GetHWND(), SB_SETPARTS, m_parts.size(),
 		reinterpret_cast<LPARAM>(partWidths.data()));
 	DCHECK(setPartsRes);
+
+	UpdateFilterBoxPosition();
 }

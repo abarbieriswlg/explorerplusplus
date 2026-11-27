@@ -5,6 +5,7 @@
 #pragma once
 
 #include <boost/signals2.hpp>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,7 @@ class TabEvents;
 class StatusBar
 {
 public:
-	StatusBar(StatusBarView *view, const BrowserWindow *browser, const Config *config,
+	StatusBar(StatusBarView *view, BrowserWindow *browser, const Config *config,
 		TabEvents *tabEvents, ShellBrowserEvents *shellBrowserEvents,
 		NavigationEvents *navigationEvents, const ResourceLoader *resourceLoader);
 
@@ -31,6 +32,8 @@ public:
 	void NotifyMenuLoopStarted();
 	void NotifyMenuLoopEnded();
 	void SetMenuHelpText(const std::wstring &text);
+
+	void FocusFilterBox();
 
 private:
 	void SetStandardParts();
@@ -42,13 +45,26 @@ private:
 	void OnNavigationsStopped(const ShellBrowser *shellBrowser);
 
 	void UpdateText(const Tab &tab);
+	void UpdateFilterBoxText(const Tab &tab);
+	void OnFilterTextChanged(const std::wstring &text);
+	void OnFilterBoxExited();
 	void SetLoadingText(PCIDLIST_ABSOLUTE pidl);
+	std::wstring GetCachedDriveFreeSpaceString(const std::wstring &path);
 	std::wstring CreateDriveFreeSpaceString(const std::wstring &path);
 
 	StatusBarView *const m_view;
-	const BrowserWindow *const m_browser;
+	BrowserWindow *const m_browser;
 	const Config *const m_config;
 	const ResourceLoader *const m_resourceLoader;
 	bool m_showingMenuHelpText = false;
+
+	struct FreeSpaceCache
+	{
+		std::wstring path;
+		std::wstring text;
+		std::chrono::steady_clock::time_point timestamp;
+	};
+
+	FreeSpaceCache m_freeSpaceCache;
 	std::vector<boost::signals2::scoped_connection> m_connections;
 };

@@ -152,6 +152,7 @@ private:
 	void OnNewTab();
 	void OnCloneWindow();
 	void OnSelectColumns();
+	void FocusQuickFilter();
 	void OnDestroyFiles();
 
 	int HighlightSimilarFiles(HWND ListView) const;

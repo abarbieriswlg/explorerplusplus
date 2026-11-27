@@ -202,6 +202,7 @@ void MainMenu::BuildViewMenu(BrowserWindow *browser, AppServices *appServices)
 
 void MainMenu::BuildFilterSubMenu(MenuView *filterMenuView)
 {
+	AppendItem(filterMenuView, IDM_FILTER_FOCUS_QUICK_FILTER, IDS_FILTER_QUICK_FILTER);
 	AppendItem(filterMenuView, IDM_FILTER_FILTERRESULTS, IDS_FILTER_FILTERRESULTS);
 	AppendItem(filterMenuView, IDM_FILTER_ENABLE_FILTER, IDS_FILTER_ENABLE_FILTER);
 }
@@ -633,6 +634,9 @@ std::optional<UINT> MainMenu::MaybeGetHelpTextIdForCommand(WORD id)
 
 	case IDM_FILTER_ENABLE_FILTER:
 		return IDS_FILTER_ENABLE_FILTER_HELP_TEXT;
+
+	case IDM_FILTER_FOCUS_QUICK_FILTER:
+		return IDS_FILTER_QUICK_FILTER_HELP_TEXT;
 
 	case IDM_ACTIONS_NEWFOLDER:
 		return IDS_ACTIONS_NEWFOLDER_HELP_TEXT;

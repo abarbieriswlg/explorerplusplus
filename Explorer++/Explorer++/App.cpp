@@ -353,8 +353,73 @@ bool App::IsModelessDialogMessage(MSG *msg)
 	return false;
 }
 
+namespace
+{
+
+// Returns true if the message is a key press that should be handled by an edit control that has
+// the keyboard focus, rather than being translated into an application command. Without this,
+// keys such as Delete (which is bound to deleting the selected files) or Ctrl+A/C/V/X would be
+// intercepted while typing in an edit control (e.g. the quick filter box).
+bool IsTextEditingKeyForEditControl(const MSG *msg)
+{
+	if (msg->message != WM_KEYDOWN)
+	{
+		return false;
+	}
+
+	WCHAR className[32];
+
+	if (GetClassName(msg->hwnd, className, static_cast<int>(std::size(className))) == 0
+		|| lstrcmpi(className, WC_EDIT) != 0)
+	{
+		return false;
+	}
+
+	bool ctrlDown = GetKeyState(VK_CONTROL) < 0;
+	bool altDown = GetKeyState(VK_MENU) < 0;
+	bool shiftDown = GetKeyState(VK_SHIFT) < 0;
+
+	if (altDown)
+	{
+		return false;
+	}
+
+	auto key = static_cast<UINT>(msg->wParam);
+
+	switch (key)
+	{
+	case VK_DELETE:
+	case VK_BACK:
+	case VK_LEFT:
+	case VK_RIGHT:
+	case VK_HOME:
+	case VK_END:
+	case VK_INSERT:
+		return true;
+	}
+
+	if (ctrlDown)
+	{
+		// Standard editing shortcuts.
+		return !shiftDown
+			&& (key == 'A' || key == 'C' || key == 'V' || key == 'X' || key == 'Z' || key == 'Y');
+	}
+
+	// Plain (or shifted) character keys are used for typing. Function keys, navigation keys
+	// (e.g. Tab, Escape, Enter) and other special keys can still be used as accelerators.
+	return key == VK_SPACE || (key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z')
+		|| (key >= VK_NUMPAD0 && key <= VK_DIVIDE) || (key >= VK_OEM_1 && key <= VK_OEM_102);
+}
+
+}
+
 bool App::MaybeTranslateAccelerator(MSG *msg)
 {
+	if (IsTextEditingKeyForEditControl(msg))
+	{
+		return false;
+	}
+
 	for (auto *browser : m_browserList.GetList())
 	{
 		if (IsChild(browser->GetView()->GetHWND(), msg->hwnd))

@@ -71,6 +71,7 @@ const std::unordered_map<std::wstring, int> ACCELERATOR_MAPPINGS = {
 
 	{ L"set_filter", IDM_FILTER_FILTERRESULTS },
 	{ L"enable_filter", IDM_FILTER_ENABLE_FILTER },
+	{ L"focus_quick_filter", IDM_FILTER_FOCUS_QUICK_FILTER },
 
 	{ L"new_folder", IDM_ACTIONS_NEWFOLDER },
 	{ L"split_file", IDM_ACTIONS_SPLITFILE },
