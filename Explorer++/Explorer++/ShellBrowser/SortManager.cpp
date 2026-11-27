@@ -51,12 +51,12 @@ int CALLBACK ShellBrowserImpl::Sort(int InternalIndex1, int InternalIndex2) cons
 	/* Folders will by default be sorted separately from files,
 	except in the recycle bin. */
 	if (!m_config->globalFolderSettings.displayMixedFilesAndFolders && isFolder1 && !isFolder2
-		&& !CompareVirtualFolders(CSIDL_BITBUCKET))
+		&& !m_directoryState.isRecycleBin)
 	{
 		comparisonResult = -1;
 	}
 	else if (!m_config->globalFolderSettings.displayMixedFilesAndFolders && !isFolder1 && isFolder2
-		&& !CompareVirtualFolders(CSIDL_BITBUCKET))
+		&& !m_directoryState.isRecycleBin)
 	{
 		comparisonResult = 1;
 	}

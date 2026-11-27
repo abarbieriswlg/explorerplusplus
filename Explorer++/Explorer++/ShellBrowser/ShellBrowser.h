@@ -97,6 +97,10 @@ public:
 	virtual void SetFilterCaseSensitive(bool caseSensitive) = 0;
 	virtual bool IsFilterEnabled() const = 0;
 	virtual void SetFilterEnabled(bool enabled) = 0;
+
+	// Sets the filter text and enables the filter in a single step (or, if the text is empty,
+	// clears and disables the filter). Used by the quick filter box in the status bar.
+	virtual void SetQuickFilter(const std::wstring &filter) = 0;
 	virtual void EditFilterSettings() = 0;
 
 	virtual bool CanSaveDirectoryListing() const = 0;

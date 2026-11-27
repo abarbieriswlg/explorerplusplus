@@ -294,6 +294,12 @@ void ShellBrowserFake::SetFilterEnabled(bool enabled)
 	m_folderSettings.filterEnabled = enabled;
 }
 
+void ShellBrowserFake::SetQuickFilter(const std::wstring &filter)
+{
+	m_folderSettings.filter = filter;
+	m_folderSettings.filterEnabled = !filter.empty();
+}
+
 void ShellBrowserFake::EditFilterSettings()
 {
 }

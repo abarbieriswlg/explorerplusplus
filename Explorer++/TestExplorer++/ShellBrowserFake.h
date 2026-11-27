@@ -78,6 +78,7 @@ public:
 	void SetFilterCaseSensitive(bool caseSensitive) override;
 	bool IsFilterEnabled() const override;
 	void SetFilterEnabled(bool enabled) override;
+	void SetQuickFilter(const std::wstring &filter) override;
 	void EditFilterSettings() override;
 	bool CanSaveDirectoryListing() const override;
 	void SaveDirectoryListing() override;

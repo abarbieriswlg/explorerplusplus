@@ -52,6 +52,7 @@ void ShellBrowserImpl::ChangeFolders(const PidlAbsolute &directory)
 	m_directoryState.pidlDirectory = directory;
 	m_directoryState.directory = GetDisplayNameWithFallback(directory.Raw(), SHGDN_FORPARSING);
 	m_directoryState.virtualFolder = isVirtualFolder;
+	m_directoryState.isRecycleBin = CompareVirtualFolders(CSIDL_BITBUCKET);
 
 	SetActiveColumnSet();
 	VerifySortMode();
@@ -449,6 +450,8 @@ void ShellBrowserImpl::OnNavigationComitted(const NavigationRequest *request)
 {
 	CHECK(request->GetShellBrowser() == this);
 
+	MaybeClearQuickFilterForNavigation(request);
+
 	ChangeFolders(request->GetNavigateParams().pidl);
 
 	NotifyShellOfNavigation(request->GetNavigateParams().pidl.Raw());
@@ -669,13 +672,7 @@ void ShellBrowserImpl::InsertAwaitingItems()
 BOOL ShellBrowserImpl::IsFileFiltered(const ItemInfo_t &itemInfo) const
 {
 	BOOL bHideSystemFile = FALSE;
-	BOOL bFilenameFiltered = FALSE;
-
-	if (m_folderSettings.filterEnabled
-		&& ((itemInfo.wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != FILE_ATTRIBUTE_DIRECTORY))
-	{
-		bFilenameFiltered = IsFilenameFiltered(itemInfo.displayName.c_str());
-	}
+	BOOL bFilenameFiltered = IsItemFilteredByName(itemInfo);
 
 	if (m_config->globalFolderSettings.hideSystemFiles)
 	{

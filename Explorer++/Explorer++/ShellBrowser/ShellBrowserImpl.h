@@ -124,6 +124,7 @@ public:
 	void SetFilterCaseSensitive(bool caseSensitive) override;
 	bool IsFilterEnabled() const override;
 	void SetFilterEnabled(bool enabled) override;
+	void SetQuickFilter(const std::wstring &filter) override;
 	void EditFilterSettings() override;
 	bool CanSaveDirectoryListing() const override;
 	void SaveDirectoryListing() override;
@@ -297,6 +298,11 @@ private:
 		PidlAbsolute pidlDirectory;
 		std::wstring directory;
 		bool virtualFolder = false;
+
+		// Whether the current directory is the recycle bin. This is cached, since it's checked
+		// on every comparison when sorting (and determining it requires a call into the shell).
+		bool isRecycleBin = false;
+
 		int itemIDCounter = 0;
 
 		/* Stores information on files that have
@@ -524,11 +530,25 @@ private:
 		WeakPtr<ShellBrowserImpl> weakSelf, PidlAbsolute currentDirectory, Runtime *runtime);
 
 	/* Filtering support. */
-	void UpdateFiltering();
-	void RemoveFilteredItems();
+	struct ParsedFilter
+	{
+		// The filter text this structure was generated from.
+		std::wstring source;
+
+		// True if the filter contains wildcard characters (or multiple patterns separated by
+		// ':'). In that case, the filter is matched as a wildcard pattern against file names.
+		bool isWildcard = false;
+
+		// For plain text filters, the space-separated terms which must all appear in an item's
+		// name.
+		std::vector<std::wstring> terms;
+	};
+
+	void ReapplyFilter();
+	void MaybeClearQuickFilterForNavigation(const NavigationRequest *request);
 	void RemoveFilteredItem(int iItem, int iItemInternal);
-	BOOL IsFilenameFiltered(const TCHAR *FileName) const;
-	void UnfilterAllItems();
+	bool IsItemFilteredByName(const ItemInfo_t &itemInfo) const;
+	const ParsedFilter &GetParsedFilter() const;
 	void UnfilterItem(int internalIndex);
 	void RestoreFilteredItem(int internalIndex);
 
@@ -680,6 +700,10 @@ private:
 	ClipboardStore *const m_clipboardStore;
 	const ResourceLoader *const m_resourceLoader;
 	FolderSettings m_folderSettings;
+
+	// Cached, parsed version of the current filter text. Parsing is done lazily, the first time
+	// an item is checked against a new filter.
+	mutable ParsedFilter m_parsedFilter;
 
 	int m_middleButtonItem;
 
