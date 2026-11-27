@@ -1743,6 +1743,7 @@
     <ClInclude Include="StartupFoldersRegistryStorage.h" />
     <ClInclude Include="StartupFoldersXmlStorage.h" />
     <ClInclude Include="StartupOptionsPage.h" />
+    <ClInclude Include="StartupTimer.h" />
     <ClInclude Include="Storage.h" />
     <ClInclude Include="TabList.h" />
     <ClInclude Include="TestHelper.h" />

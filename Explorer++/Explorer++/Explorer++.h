@@ -219,6 +219,7 @@ private:
 	/** Internal state. **/
 	HWND m_lastActiveWindow;
 	bool m_bShowTabBar;
+	bool m_firstNavigationCommitted = false;
 
 #if DCHECK_IS_ON()
 	bool m_performingLayout = false;

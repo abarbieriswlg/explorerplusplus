@@ -11,6 +11,7 @@
 #include "ShellBrowser/NavigationRequest.h"
 #include "ShellBrowser/ShellBrowserEvents.h"
 #include "ShellBrowser/ShellBrowserImpl.h"
+#include "StartupTimer.h"
 #include "TabBar.h"
 #include "TabBarBacking.h"
 #include "TabBarView.h"
@@ -86,6 +87,13 @@ void Explorerplusplus::OnTabCreated(const Tab &tab)
 
 void Explorerplusplus::OnNavigationCommitted(const NavigationRequest *request)
 {
+	if (!m_firstNavigationCommitted)
+	{
+		// This is the point at which the user can actually see the contents of a folder.
+		LogTimeSinceProcessStart("first folder displayed");
+		m_firstNavigationCommitted = true;
+	}
+
 	const auto *tab = request->GetShellBrowser()->GetTab();
 	UpdateWindowStates(*tab);
 }
@@ -150,6 +158,12 @@ void Explorerplusplus::CreateTabsFromStorageData(const WindowStorageData &storag
 		auto tabSettings = loadedTab.tabSettings;
 		tabSettings.index = index;
 
+		// Only the tab that will be selected is loaded straight away. The other tabs are loaded
+		// when they're first selected, which can significantly reduce the startup time when there
+		// are many tabs, or when some of the tabs refer to slow locations (e.g. network shares).
+		bool isSelectedTab = (index == storageData.selectedTab);
+		tabSettings.deferNavigation = !isSelectedTab;
+
 		auto validatedColumns = loadedTab.columns;
 		ValidateColumns(validatedColumns);
 
@@ -158,6 +172,22 @@ void Explorerplusplus::CreateTabsFromStorageData(const WindowStorageData &storag
 		if (loadedTab.pidl.HasValue())
 		{
 			directory = loadedTab.pidl;
+		}
+		else if (!isSelectedTab && PathIsUNC(loadedTab.directory.c_str()))
+		{
+			// Fully parsing a network path requires contacting the server, which can block for a
+			// long time if the server isn't currently available (e.g. because a VPN connection
+			// hasn't been established yet). Since this tab won't be shown straight away, a simple
+			// pidl is created instead, which doesn't require any network access. The path will be
+			// fully parsed when the tab is first selected (see
+			// TabBar::MaybeStartDeferredNavigation()).
+			directory = PidlAbsolute(SHSimpleIDListFromPath(loadedTab.directory.c_str()),
+				Pidl::takeOwnership);
+
+			if (!directory.HasValue())
+			{
+				continue;
+			}
 		}
 		else
 		{
@@ -178,10 +208,18 @@ void Explorerplusplus::CreateTabsFromStorageData(const WindowStorageData &storag
 		index++;
 	}
 
-	if (storageData.selectedTab >= 0
-		&& storageData.selectedTab < GetActivePane()->GetTabBar()->GetNumTabs())
+	auto *tabBar = GetActivePane()->GetTabBar();
+
+	if (storageData.selectedTab >= 0 && storageData.selectedTab < tabBar->GetNumTabs())
 	{
-		GetActivePane()->GetTabBar()->SelectTabAtIndex(storageData.selectedTab);
+		tabBar->SelectTabAtIndex(storageData.selectedTab);
+	}
+
+	// Tabs in the background are only loaded once they're selected, but the tab that's selected
+	// now needs to be loaded immediately.
+	if (tabBar->GetNumTabs() > 0)
+	{
+		tabBar->MaybeStartDeferredNavigation(tabBar->GetSelectedTab());
 	}
 }
 

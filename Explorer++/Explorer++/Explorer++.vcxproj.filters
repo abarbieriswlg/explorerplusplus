@@ -1623,6 +1623,7 @@
     <ClInclude Include="StartupOptionsPage.h">
       <Filter>Dialogs\Options</Filter>
     </ClInclude>
+    <ClInclude Include="StartupTimer.h" />
     <ClInclude Include="StartupFoldersRegistryStorage.h">
       <Filter>Startup</Filter>
     </ClInclude>

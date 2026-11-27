@@ -27,6 +27,7 @@
 #include "ResourceHelper.h"
 #include "SessionRestorer.h"
 #include "ShellWatcher.h"
+#include "StartupTimer.h"
 #include "TabStorage.h"
 #include "UIThreadExecutor.h"
 #include "Win32ResourceLoader.h"
@@ -137,8 +138,15 @@ int App::Run()
 
 void App::SetUpSession()
 {
+	LogTimeSinceProcessStart("session setup started");
+	ScopedStartupTimer sessionTimer("session setup (total)");
+
 	std::vector<WindowStorageData> windows;
-	LoadSettings(windows);
+
+	{
+		ScopedStartupTimer timer("loading settings");
+		LoadSettings(windows);
+	}
 
 	// This function may attempt to notify an existing process if the allowMultipleInstances config
 	// value is disabled. Therefore, this call needs to be made after the settings have been loaded.
@@ -150,12 +158,23 @@ void App::SetUpSession()
 	}
 
 	SetUpAppServices();
-	SetupJumpListTasks(m_resourceLoader.get());
-	InitializePlugins();
 
-	SessionRestorer sessionRestorer(m_commandLineSettings, &m_config, &m_featureList,
-		m_browserWindowFactory.get(), &m_shellNameParser);
-	sessionRestorer.Restore(windows);
+	{
+		ScopedStartupTimer timer("setting up jump list");
+		SetupJumpListTasks(m_resourceLoader.get());
+	}
+
+	{
+		ScopedStartupTimer timer("loading plugins");
+		InitializePlugins();
+	}
+
+	{
+		ScopedStartupTimer timer("restoring windows and tabs");
+		SessionRestorer sessionRestorer(m_commandLineSettings, &m_config, &m_featureList,
+			m_browserWindowFactory.get(), &m_shellNameParser);
+		sessionRestorer.Restore(windows);
+	}
 }
 
 void App::LoadSettings(std::vector<WindowStorageData> &windows)

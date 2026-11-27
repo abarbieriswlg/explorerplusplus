@@ -26,6 +26,7 @@
 #include "Runtime.h"
 #include "ShellBrowser/ShellBrowserImpl.h"
 #include "ShellTreeView/ShellTreeView.h"
+#include "StartupTimer.h"
 #include "StatusBar.h"
 #include "TabEvents.h"
 #include "TabRestorer.h"
@@ -106,16 +107,28 @@ void Explorerplusplus::SetUpLayoutConfigListeners()
 
 void Explorerplusplus::Initialize(const WindowStorageData &storageData)
 {
-	InitializeMainMenu();
+	{
+		ScopedStartupTimer timer("creating main menu");
+		InitializeMainMenu();
+	}
 
 	m_statusBar = std::make_unique<StatusBar>(m_view.GetStatusBarView(), this, m_config,
 		m_tabEvents, m_shellBrowserEvents, m_navigationEvents, m_resourceLoader);
 
-	CreateMainRebarAndChildren(storageData);
+	{
+		ScopedStartupTimer timer(
+			"creating toolbars (main, address, bookmarks, drives, applications)");
+		CreateMainRebarAndChildren(storageData);
+	}
+
 	CreateDisplayWindow();
 	InitializeTabObservers();
 	InitializeTabs();
-	CreateFolderControls();
+
+	{
+		ScopedStartupTimer timer("creating folders pane (treeview)");
+		CreateFolderControls();
+	}
 
 	/* All child windows MUST be resized before
 	any listview changes take place. If auto arrange
@@ -127,7 +140,10 @@ void Explorerplusplus::Initialize(const WindowStorageData &storageData)
 	size initially. */
 	UpdateLayout();
 
-	CreateInitialTabs(storageData);
+	{
+		ScopedStartupTimer timer("creating initial tabs");
+		CreateInitialTabs(storageData);
+	}
 
 	SetFocus(m_hActiveListView);
 
