@@ -144,7 +144,8 @@ void BookmarksMenu::OnBookmarkSelected(WeakPtr<BookmarkItem> bookmark, bool isCt
 	}
 
 	BookmarkHelper::OpenBookmarkItemWithDisposition(bookmark.Get(),
-		DetermineOpenDisposition(false, isCtrlKeyDown, isShiftKeyDown), m_browser);
+		DetermineOpenDisposition(false, isCtrlKeyDown, isShiftKeyDown), m_browser, m_bookmarkTree,
+		m_resourceLoader);
 }
 
 void BookmarksMenu::OnBookmarkItemMiddleClicked(WeakPtr<BookmarkItem> bookmarkItem,
@@ -156,7 +157,8 @@ void BookmarksMenu::OnBookmarkItemMiddleClicked(WeakPtr<BookmarkItem> bookmarkIt
 	}
 
 	BookmarkHelper::OpenBookmarkItemWithDisposition(bookmarkItem.Get(),
-		DetermineOpenDisposition(true, isCtrlKeyDown, isShiftKeyDown), m_browser);
+		DetermineOpenDisposition(true, isCtrlKeyDown, isShiftKeyDown), m_browser, m_bookmarkTree,
+		m_resourceLoader);
 }
 
 void BookmarksMenu::OnBookmarkItemRightClicked(WeakPtr<BookmarkItem> bookmarkItem,
